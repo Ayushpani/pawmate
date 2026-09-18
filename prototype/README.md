@@ -17,21 +17,33 @@ stack. Plain Python, one file, no build step.
 
 - Transparent, always-on-top, **click-through** overlay window (empty space
   passes clicks through to whatever's beneath; the cat itself is clickable)
-- A procedurally drawn cat (no external assets, so no licensing to sort out
-  for a prototype) with **idle / walk / sit / sleep** poses and a walk cycle
+- A procedurally drawn cat, in **side profile** — idle / walk / sit / sleep,
+  a real walk-cycle gait, and one-shot **jump** (on a successful app open)
+  and **paw-swipe** (on app close) action animations. It always faces the
+  direction it's actually walking, instead of staring at the screen while
+  sliding sideways.
 - Wanders the screen, and — best-effort — walks between your **real desktop
   icon positions**, pausing at each one, so it visibly "visits your folders"
 - **Drag** to pick it up and move it
+- **Open any installed app by name through chat** — resolved dynamically
+  against everything Windows' own Start menu knows about (via
+  `Get-StartApps`, the same list Start menu search uses — covers classic
+  desktop apps *and* Store/UWP apps). Typo the name ("chrom") and it asks
+  **"did you mean 'Chrome'?"** instead of failing with a raw file-not-found
+  error. There's no hardcoded app list to fall out of date.
 - Right-click menu:
-  - **Open App** — Notepad / Calculator / Explorer / Paint / Browser, or
-    browse for any `.exe`
   - **Close App** — pick from currently open windows; always asks
     **"Close 'X'?"** before doing it (destructive action = your click, never
-    automatic)
-  - Sit / Sleep / Walk, Chat, Quit
+    automatic). Kept as a menu because it lists *running* windows, which
+    the Start menu can't show you — that's genuinely different information,
+    not a worse copy of a button you already have.
+  - Sit / Sleep / Walk, Chat, Open app…, Quit
+  - (There's no static "Open App" list — the first version had one and it
+    was just a clunkier Start menu. Chat's resolver replaces it.)
 - **Works with zero AI.** Double-click the cat (or use the menu) to open a
   command bar; typed commands like `open notepad`, `close chrome`, `walk`,
-  `sit`, `sleep` are parsed locally, no network call.
+  `sit`, `sleep` are parsed locally, no network call. `open` and `close`
+  always go through the same dynamic resolver/confirm flow either way.
 - **Optional free LLM** for free-text commands: set `OPENROUTER_API_KEY`
   (OpenRouter's free-tier models) or `CF_ACCOUNT_ID` + `CF_API_TOKEN`
   (Cloudflare Workers AI free tier) as environment variables and the command
@@ -54,9 +66,12 @@ start wandering, and (if it can find your desktop icons) start visiting them.
 
 ### Try it
 
-- **Right-click** the cat → **Open App → Notepad** — Notepad opens.
+- **Double-click** the cat → type `open notepad` — it launches Notepad and
+  plays a little celebration jump.
+- **Double-click** the cat → type `open chrom` (a typo) — it should ask
+  *"did you mean 'Google Chrome'?"* rather than erroring out.
 - **Right-click** the cat → **Close App** → pick Notepad from the list →
-  confirm — Notepad closes.
+  confirm — Notepad closes with a paw-swipe animation.
 - **Drag** the cat around with the left mouse button.
 - **Double-click** the cat → type `sleep` → it curls up and naps.
 - Try typing in another window (e.g. Notepad) while the cat wanders near
@@ -119,9 +134,11 @@ setup itself rather than the later Win32 styling pass.
   (transparency, click-through, precise movement, app open/close with
   confirmation, optional free-LLM chat) on real Windows before that
   investment.
-- `Browser` in the Open App list shells out to `start microsoft-edge:`,
-  which opens your **default** browser via the OS association, not
-  necessarily Edge specifically.
+- **App resolution** needs `powershell` on PATH (it ships with every
+  Windows 10/11 install, so this should always be true) and takes ~0.5–1s
+  to build the first time, in a background thread — if you `open` something
+  in the first second after launch it may say "still indexing," just retry.
+  It refreshes itself every 10 minutes in case you install something new.
 - No packaging yet (no `.exe`). `pyinstaller pawmate_prototype.py
   --onefile --windowed` will produce a double-clickable `.exe` once you're
   happy with the behavior — ask and I'll wire that up too.

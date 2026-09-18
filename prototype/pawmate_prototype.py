@@ -8,20 +8,29 @@ with plain Python.
 
 What it demonstrates (no AI required):
   - A transparent, always-on-top, click-through overlay window (S1/S2 style spike)
-  - A procedurally drawn cat (no external art assets / licensing needed) with
-    idle / walk / sit / sleep poses and a simple walk-cycle animation
+  - A procedurally drawn cat (no external art assets / licensing needed), in
+    side profile — idle / walk / sit / sleep, a real walk-cycle gait, and
+    one-shot jump/swipe action animations, all facing the direction it's
+    actually moving in
   - Precise movement: wanders the screen, or (best-effort) walks between your real
     desktop icon positions, pausing at each one ("walking over your folders")
   - Drag-to-move
-  - Right-click menu: Open App (curated list or browse for any .exe) and
-    Close App (pick a running window, confirm before closing — destructive
-    action = human click, per the plan's principles)
+  - Open any installed app by name via chat — resolved dynamically against
+    everything Windows' own Start menu knows about (Get-StartApps), with a
+    "did you mean X?" confirm on a typo instead of a dead "file not found"
+  - Right-click menu: Close App (pick a running window, confirm before
+    closing — destructive action = human click, per the plan's principles;
+    kept as a live menu because it shows *running* windows, which Start
+    Menu can't — Open App as a static list was cut, since chat's resolver
+    replaces it and a hardcoded list was never anything but a worse Start
+    menu)
   - A chat/command bar: typed commands are parsed locally first with zero AI
     ("open notepad", "close chrome", "walk", "sit", "sleep"). If you set
     OPENROUTER_API_KEY (or CF_ACCOUNT_ID + CF_API_TOKEN for Cloudflare
     Workers AI) as environment variables, free-text goes to a free LLM to
     pick an action — but nothing destructive ever runs without your
-    confirm click.
+    confirm click, and open/close app names still go through the same
+    resolver either way.
 
 What it is NOT: this is not the final Rust/Tauri/Three.js pet. There's no
 tracking, no browser extension, no database, no license/auth. It's a fast,
@@ -35,15 +44,18 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wt
+import difflib
 import json
 import math
 import os
 import random
+import re
 import subprocess
 import sys
+import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog
+from tkinter import messagebox, simpledialog
 from dataclasses import dataclass, field
 
 if sys.platform != "win32":
@@ -81,22 +93,19 @@ CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "").strip()
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "").strip()
 CF_MODEL = os.environ.get("CF_MODEL", "@cf/meta/llama-3.1-8b-instruct")
 
-CURATED_APPS = {
-    "Notepad": "notepad.exe",
-    "Calculator": "calc.exe",
-    "File Explorer": "explorer.exe",
-    "Paint": "mspaint.exe",
-    "Browser": "start microsoft-edge:",  # falls back to default browser via shell
-}
-
 # ---------------------------------------------------------------------------
 # Cat sprite drawing (procedural, no external assets)
 #
-# Drawn front-on, chibi-proportioned (big head, small body) — this reads as
-# a recognizable, cute cat at the small sizes a desktop pet is rendered at,
-# which a thin side-profile silhouette does not. Everything is drawn at
-# SUPERSAMPLE x the final size and downscaled with LANCZOS for anti-aliased
-# edges, since PIL's ImageDraw has no native anti-aliasing.
+# Side-profile, facing +x (right) by default — mirrored for facing left.
+# A front-on chibi face was tried first and looked cute standing still, but
+# a desktop pet spends most of its life walking, and a face that always
+# stares at the viewer regardless of travel direction doesn't read as
+# "walking somewhere." Side profile makes the direction of travel legible
+# at a glance, the way every classic desktop-pet sprite (Neko, Shimeji, …)
+# does it.
+#
+# Everything is drawn at SUPERSAMPLE x the final size and downscaled with
+# LANCZOS for anti-aliased edges, since PIL's ImageDraw has no native AA.
 #
 # Every fill is fully opaque (alpha 255) except the transparent color key —
 # Tk's -transparentcolor does exact color-key matching, not alpha blending,
@@ -108,7 +117,7 @@ CURATED_APPS = {
 SUPERSAMPLE = 5
 
 FUR = (240, 165, 80, 255)
-FUR_DARK = (210, 128, 54, 255)
+FUR_DARK = (208, 126, 52, 255)
 CREAM = (255, 246, 227, 255)
 BLACK = (35, 30, 28, 255)
 PINK = (255, 176, 188, 255)
@@ -116,7 +125,10 @@ PINK_SOFT = (255, 214, 222, 255)
 WHITE = (255, 255, 255, 255)
 NOSE = (232, 140, 150, 255)
 WHISKER = (120, 95, 80, 255)
+SHADOW = (180, 60, 130, 90)
 MAGENTA_OPAQUE = (255, 0, 255, 255)
+
+GROUND_Y = 124  # paws rest on this line, in the 140x140 logical canvas
 
 
 def _s(v: float) -> float:
@@ -140,102 +152,80 @@ def _line(d: ImageDraw.ImageDraw, pts, fill, width):
     d.line([(_s(x), _s(y)) for x, y in pts], fill=fill, width=int(_s(width)), joint="curve")
 
 
-def _ear(d: ImageDraw.ImageDraw, base_x, base_y, tip_x, tip_y, width, fill, inner=None):
-    dx, dy = tip_x - base_x, tip_y - base_y
-    length = math.hypot(dx, dy)
-    nx, ny = -dy / length, dx / length
-    p1 = (base_x - nx * width / 2, base_y - ny * width / 2)
-    p2 = (base_x + nx * width / 2, base_y + ny * width / 2)
-    d.polygon([(_s(p1[0]), _s(p1[1])), (_s(p2[0]), _s(p2[1])), (_s(tip_x), _s(tip_y))], fill=fill)
-    for p in (p1, p2):  # rounds the ear's base corners
-        _ellipse(d, p[0], p[1], width * 0.22, width * 0.22, fill=fill)
-    if inner:
-        ix, iy = base_x + dx * 0.34, base_y + dy * 0.34
-        iw = width * 0.4
-        ip1 = (ix - nx * iw / 2, iy - ny * iw / 2)
-        ip2 = (ix + nx * iw / 2, iy + ny * iw / 2)
-        tip2 = (tip_x - dx * 0.22, tip_y - dy * 0.22)
-        d.polygon([(_s(ip1[0]), _s(ip1[1])), (_s(ip2[0]), _s(ip2[1])), (_s(tip2[0]), _s(tip2[1]))], fill=inner)
+def _tri(d: ImageDraw.ImageDraw, pts, fill):
+    d.polygon([(_s(x), _s(y)) for x, y in pts], fill=fill)
 
 
-def _paw(d: ImageDraw.ImageDraw, cx, cy, r):
-    _ellipse(d, cx, cy, r, r * 0.75, fill=CREAM, outline=FUR_DARK, width=max(1, int(_s(r) * 0.18)))
+def _leg(d: ImageDraw.ImageDraw, top, bottom_x, bottom_y, width, paw_r):
+    _line(d, [top, (bottom_x, bottom_y)], FUR_DARK, width)
+    _ellipse(d, bottom_x, bottom_y, paw_r, paw_r * 0.72, fill=CREAM, outline=FUR_DARK, width=max(1, int(_s(1.2))))
 
 
-def _face(d: ImageDraw.ImageDraw, cx, cy, r, eyes_closed=False, blush=True):
-    _ear(d, cx - r * 0.58, cy - r * 0.52, cx - r * 0.92, cy - r * 1.55, r * 0.62, FUR_DARK, PINK)
-    _ear(d, cx + r * 0.58, cy - r * 0.52, cx + r * 0.92, cy - r * 1.55, r * 0.62, FUR_DARK, PINK)
-    _ellipse(d, cx, cy, r, r * 0.94, fill=FUR)  # head
-    _ellipse(d, cx - r * 0.8, cy + r * 0.32, r * 0.4, r * 0.32, fill=FUR)  # cheek fluff
-    _ellipse(d, cx + r * 0.8, cy + r * 0.32, r * 0.4, r * 0.32, fill=FUR)
-    _ellipse(d, cx, cy + r * 0.4, r * 0.6, r * 0.42, fill=CREAM)  # muzzle
-    for off in (-0.3, 0.0, 0.3):  # forehead tabby stripes
-        x = cx + off * r
-        _line(d, [(x, cy - r * 0.82), (x + off * r * 0.2, cy - r * 0.38)], FUR_DARK, r * 0.1)
+def _head_side(d: ImageDraw.ImageDraw, hx, hy, r, eyes_closed=False, blush=False):
+    """Head in side profile, snout pointing toward +x (the walk direction)."""
+    _tri(d, [(hx - r * 0.35, hy - r * 0.75), (hx - r * 0.55, hy - r * 1.55), (hx + r * 0.05, hy - r * 0.85)],
+         FUR_DARK)  # far ear
+    _ellipse(d, hx, hy, r, r * 0.92, fill=FUR)  # head
+    _tri(d, [(hx + r * 0.15, hy - r * 0.78), (hx + r * 0.05, hy - r * 1.6), (hx + r * 0.62, hy - r * 0.85)],
+         FUR_DARK)  # near ear
+    _tri(d, [(hx + r * 0.24, hy - r * 0.78), (hx + r * 0.2, hy - r * 1.35), (hx + r * 0.5, hy - r * 0.86)], PINK)
+    _ellipse(d, hx + r * 0.86, hy + r * 0.18, r * 0.42, r * 0.34, fill=CREAM)  # snout
+    for off in (-0.15, 0.15, 0.42):  # forehead tabby stripes
+        _line(d, [(hx + off * r, hy - r * 0.7), (hx + off * r + r * 0.12, hy - r * 0.25)], FUR_DARK, r * 0.09)
     if blush:
-        _ellipse(d, cx - r * 0.7, cy + r * 0.16, r * 0.2, r * 0.13, fill=PINK_SOFT)
-        _ellipse(d, cx + r * 0.7, cy + r * 0.16, r * 0.2, r * 0.13, fill=PINK_SOFT)
-    ex_off, ey = r * 0.34, cy - r * 0.02
-    eye_r = r * 0.28
-    for sx in (-1, 1):
-        ex = cx + sx * ex_off
-        if eyes_closed:
-            d.arc([_s(ex - eye_r * 0.9), _s(ey - eye_r * 0.35), _s(ex + eye_r * 0.9), _s(ey + eye_r * 0.55)],
-                  start=15, end=165, fill=BLACK, width=max(1, int(_s(r * 0.075))))
-        else:
-            _ellipse(d, ex, ey, eye_r * 0.6, eye_r, fill=BLACK)
-            _ellipse(d, ex - eye_r * 0.18, ey - eye_r * 0.4, eye_r * 0.22, eye_r * 0.26, fill=WHITE)
-            _ellipse(d, ex + eye_r * 0.2, ey + eye_r * 0.3, eye_r * 0.1, eye_r * 0.12, fill=WHITE)
-    nr = r * 0.1
-    ny = cy + r * 0.32
-    d.polygon([(_s(cx - nr), _s(ny - nr * 0.6)), (_s(cx + nr), _s(ny - nr * 0.6)), (_s(cx), _s(ny + nr * 0.7))],
-              fill=NOSE)
-    mw = r * 0.2
-    my = ny + nr * 0.7
-    d.arc([_s(cx - mw), _s(my - mw * 0.5), _s(cx), _s(my + mw * 0.9)], start=15, end=165, fill=BLACK,
-          width=int(_s(r * 0.05)))
-    d.arc([_s(cx), _s(my - mw * 0.5), _s(cx + mw), _s(my + mw * 0.9)], start=15, end=165, fill=BLACK,
-          width=int(_s(r * 0.05)))
-    for wy_off in (-0.06, 0.08, 0.22):
-        wy = cy + r * (0.4 + wy_off)
-        _line(d, [(cx - r * 0.6, wy), (cx - r * 1.15, wy - r * 0.05)], WHISKER, r * 0.03)
-        _line(d, [(cx + r * 0.6, wy), (cx + r * 1.15, wy - r * 0.05)], WHISKER, r * 0.03)
+        _ellipse(d, hx - r * 0.15, hy + r * 0.25, r * 0.16, r * 0.11, fill=PINK_SOFT)
+    ex, ey = hx + r * 0.28, hy - r * 0.05
+    eye_r = r * 0.26
+    if eyes_closed:
+        d.arc([_s(ex - eye_r * 0.85), _s(ey - eye_r * 0.3), _s(ex + eye_r * 0.85), _s(ey + eye_r * 0.55)],
+              start=15, end=165, fill=BLACK, width=max(1, int(_s(r * 0.08))))
+    else:
+        _ellipse(d, ex, ey, eye_r * 0.66, eye_r, fill=BLACK)
+        _ellipse(d, ex - eye_r * 0.15, ey - eye_r * 0.35, eye_r * 0.24, eye_r * 0.28, fill=WHITE)
+    nx, ny = hx + r * 1.18, hy + r * 0.14  # nose + mouth at the snout tip
+    nr = r * 0.13
+    _tri(d, [(nx - nr, ny - nr * 0.6), (nx + nr * 0.3, ny - nr * 0.6), (nx - nr * 0.35, ny + nr * 0.7)], NOSE)
+    d.arc([_s(nx - r * 0.32), _s(ny), _s(nx + r * 0.02), _s(ny + r * 0.3)], start=250, end=360, fill=BLACK,
+          width=max(1, int(_s(r * 0.045))))
+    for wy_off in (-0.05, 0.12):
+        wy = hy + r * (0.15 + wy_off)
+        _line(d, [(hx + r * 0.95, wy), (hx + r * 1.6, wy - r * 0.1)], WHISKER, r * 0.03)
 
 
 def _draw_walk(phase: float) -> Image.Image:
     img = _new_frame()
     d = ImageDraw.Draw(img)
-    bob = math.sin(phase * 2 * math.pi) * 2.2
-    leg = math.sin(phase * 2 * math.pi) * 6
-    body_cx, body_cy = 70, 100 + bob * 0.4
+    stride = math.sin(phase * 2 * math.pi)
+    bob = abs(math.cos(phase * 2 * math.pi)) * 3.0
+    body_cx, body_cy = 62, 98 - bob
 
-    tail_swing = math.sin(phase * 2 * math.pi) * 5
-    _line(d, [(body_cx + 30, body_cy - 2), (body_cx + 50, body_cy - 24 + tail_swing),
-              (body_cx + 42, body_cy - 46 + tail_swing)], FUR_DARK, 9)
-    _paw(d, body_cx - 14 - leg, body_cy + 26, 7)  # back paws
-    _paw(d, body_cx + 14 + leg, body_cy + 26, 7)
-    _ellipse(d, body_cx, body_cy, 32, 24, fill=FUR)  # body
-    _ellipse(d, body_cx, body_cy + 6, 21, 15, fill=CREAM)
-    _paw(d, body_cx - 16 + leg, body_cy + 24, 6.5)  # front paws
-    _paw(d, body_cx + 16 - leg, body_cy + 24, 6.5)
-    _face(d, body_cx, body_cy - 34 + bob * 0.6, 30)
+    tail_swing = stride * 10  # trails behind (-x), swinging opposite the stride
+    _line(d, [(body_cx - 28, body_cy - 2), (body_cx - 50, body_cy - 22 + tail_swing * 0.4),
+              (body_cx - 58, body_cy - 44 + tail_swing)], FUR_DARK, 8)
+    _leg(d, (body_cx - 16, body_cy + 8), body_cx - 16 + stride * 9, GROUND_Y, 6, 6)  # back legs
+    _leg(d, (body_cx - 6, body_cy + 10), body_cx - 6 - stride * 5, GROUND_Y, 5.5, 5.5)
+    _ellipse(d, body_cx, body_cy, 34, 19, fill=FUR)  # body
+    _ellipse(d, body_cx + 2, body_cy + 5, 22, 11, fill=CREAM)
+    _leg(d, (body_cx + 22, body_cy + 9), body_cx + 22 - stride * 9, GROUND_Y, 6, 6)  # front legs
+    _leg(d, (body_cx + 30, body_cy + 8), body_cx + 30 + stride * 5, GROUND_Y, 5.5, 5.5)
+    _head_side(d, body_cx + 40, body_cy - 20 - bob * 0.3, 21)
     return _downsample(img)
 
 
 def _draw_idle(phase: float, blink: bool) -> Image.Image:
     img = _new_frame()
     d = ImageDraw.Draw(img)
-    breathe = math.sin(phase * 2 * math.pi) * 1.2
-    body_cx, body_cy = 70, 102
+    breathe = math.sin(phase * 2 * math.pi) * 1.3
+    body_cx, body_cy = 62, 100
 
-    tail_swish = math.sin(phase * 2 * math.pi * 0.6) * 4
-    _line(d, [(body_cx + 30, body_cy - 2), (body_cx + 48, body_cy - 22 + tail_swish),
-              (body_cx + 40, body_cy - 42 + tail_swish)], FUR_DARK, 9)
-    _paw(d, body_cx - 15, body_cy + 25, 7)
-    _paw(d, body_cx + 15, body_cy + 25, 7)
-    _ellipse(d, body_cx, body_cy - breathe * 0.15, 32 + breathe, 24 + breathe * 0.4, fill=FUR)
-    _ellipse(d, body_cx, body_cy + 6, 21, 15, fill=CREAM)
-    _face(d, body_cx, body_cy - 34 - breathe * 0.2, 30, eyes_closed=blink)
+    tail_swish = math.sin(phase * 2 * math.pi * 0.5) * 6
+    _line(d, [(body_cx - 28, body_cy - 2), (body_cx - 50, body_cy - 20 + tail_swish),
+              (body_cx - 56, body_cy - 42 + tail_swish)], FUR_DARK, 8)
+    _leg(d, (body_cx - 16, body_cy + 8), body_cx - 16, GROUND_Y, 6, 6)
+    _leg(d, (body_cx + 24, body_cy + 9), body_cx + 24, GROUND_Y, 6, 6)
+    _ellipse(d, body_cx, body_cy - breathe * 0.15, 34 + breathe * 0.5, 19 + breathe * 0.3, fill=FUR)
+    _ellipse(d, body_cx + 2, body_cy + 5, 22, 11, fill=CREAM)
+    _head_side(d, body_cx + 40, body_cy - 20 - breathe * 0.2, 21, eyes_closed=blink)
     return _downsample(img)
 
 
@@ -243,15 +233,18 @@ def _draw_sit(phase: float) -> Image.Image:
     img = _new_frame()
     d = ImageDraw.Draw(img)
     breathe = math.sin(phase * 2 * math.pi) * 1.0
-    body_cx, body_cy = 70, 108
+    body_cx, body_cy = 58, 96
 
-    _line(d, [(body_cx + 28, body_cy - 6), (body_cx + 48, body_cy + 12), (body_cx + 36, body_cy + 30),
-              (body_cx + 14, body_cy + 26)], FUR_DARK, 8)
-    _ellipse(d, body_cx, body_cy, 34, 27, fill=FUR)
-    _ellipse(d, body_cx, body_cy + 5, 22, 18, fill=CREAM)
-    _paw(d, body_cx - 17, body_cy + 26, 7.5)
-    _paw(d, body_cx + 17, body_cy + 26, 7.5)
-    _face(d, body_cx, body_cy - 40 - breathe * 0.2, 31)
+    _line(d, [(body_cx - 26, body_cy + 6), (body_cx - 40, body_cy + 22), (body_cx - 20, body_cy + 32),
+              (body_cx + 6, body_cy + 24)], FUR_DARK, 7)  # tail curls around the front paws
+    _ellipse(d, body_cx - 6, body_cy + 12, 28, 22, fill=FUR)  # haunch, resting on the ground
+    _line(d, [(body_cx + 20, body_cy - 2), (body_cx + 22, GROUND_Y)], FUR_DARK, 7)  # upright front legs
+    _ellipse(d, body_cx + 22, GROUND_Y, 6.5, 5.5, fill=CREAM, outline=FUR_DARK, width=2)
+    _line(d, [(body_cx + 32, body_cy + 2), (body_cx + 34, GROUND_Y)], FUR_DARK, 6.5)
+    _ellipse(d, body_cx + 34, GROUND_Y, 6, 5, fill=CREAM, outline=FUR_DARK, width=2)
+    _ellipse(d, body_cx + 14, body_cy - 22, 20, 26, fill=FUR)  # torso rising to the head
+    _ellipse(d, body_cx + 16, body_cy - 14, 12, 15, fill=CREAM)
+    _head_side(d, body_cx + 30, body_cy - 46 - breathe * 0.2, 21)
     return _downsample(img)
 
 
@@ -264,9 +257,20 @@ def _draw_sleep(phase: float) -> Image.Image:
     _ellipse(d, cx, cy + breathe * 0.2, 44, 22 + breathe * 0.5, fill=FUR)  # curled loaf body
     _ellipse(d, cx - 2, cy + 6, 28, 12, fill=CREAM)
     d.arc([_s(cx - 34), _s(cy - 24), _s(cx + 38), _s(cy + 20)], start=195, end=345, fill=FUR_DARK, width=int(_s(7)))
-    _paw(d, cx - 20, cy + 16, 6.5)  # front paws tucked under chin
-    _paw(d, cx - 4, cy + 18, 6.5)
-    _face(d, cx - 32, cy - 14, 24, eyes_closed=True, blush=False)  # tucked head, reuses the standard face
+    _ellipse(d, cx - 20, cy + 16, 6.5, 5, fill=CREAM, outline=FUR_DARK, width=2)  # front paws tucked under chin
+    _ellipse(d, cx - 4, cy + 18, 6.5, 5, fill=CREAM, outline=FUR_DARK, width=2)
+
+    hx, hy, rh = cx - 32, cy - 14, 24
+    _tri(d, [(hx - rh * 0.5, hy - rh * 0.55), (hx - rh * 0.9, hy - rh * 1.35), (hx - rh * 0.1, hy - rh * 0.65)],
+         FUR_DARK)
+    _ellipse(d, hx, hy, rh, rh * 0.88, fill=FUR)
+    _ellipse(d, hx, hy + rh * 0.32, rh * 0.55, rh * 0.36, fill=CREAM)
+    d.arc([_s(hx - rh * 0.5), _s(hy - 6), _s(hx + rh * 0.02), _s(hy + 8)], start=10, end=170,
+          fill=BLACK, width=max(1, int(_s(rh * 0.12))))
+    nr = rh * 0.1
+    _tri(d, [(hx - rh * 0.02 - nr, hy + 5), (hx - rh * 0.02 + nr, hy + 5), (hx - rh * 0.02, hy + 5 + nr * 1.3)],
+         NOSE)
+
     zx, zy = cx + 34, cy - 34  # drifting "Zzz"
     for i, sz_mult in enumerate((1.0, 0.78, 0.58)):
         zxi, zyi = zx + i * 8, zy - i * 11
@@ -276,15 +280,65 @@ def _draw_sleep(phase: float) -> Image.Image:
     return _downsample(img)
 
 
+def _draw_jump(phase: float) -> Image.Image:
+    """One-shot celebration hop, played when an app successfully opens."""
+    img = _new_frame()
+    d = ImageDraw.Draw(img)
+    rise = math.sin(phase * math.pi) * 34
+    squash = 1.0 - 0.25 * math.sin(phase * math.pi)
+    body_cx, body_cy = 65, 100 - rise
+
+    shadow_scale = 1.0 - 0.55 * math.sin(phase * math.pi)  # shrinks as the cat rises, sells the height
+    _ellipse(d, body_cx, GROUND_Y + 2, 26 * shadow_scale, 6 * shadow_scale, fill=SHADOW)
+
+    tail_swing = math.sin(phase * math.pi) * 14
+    _line(d, [(body_cx - 28, body_cy), (body_cx - 46, body_cy - 18 - tail_swing * 0.3),
+              (body_cx - 50, body_cy - 40 - tail_swing)], FUR_DARK, 8)
+    tuck = math.sin(phase * math.pi)  # legs tuck up mid-air
+    _leg(d, (body_cx - 16, body_cy + 6), body_cx - 18, GROUND_Y - tuck * 14, 6, 6)
+    _ellipse(d, body_cx, body_cy, 34 * squash, 19 / squash * 0.85, fill=FUR)
+    _ellipse(d, body_cx + 2, body_cy + 4, 22 * squash, 11, fill=CREAM)
+    _leg(d, (body_cx + 22, body_cy + 7), body_cx + 24, GROUND_Y - tuck * 14, 6, 6)
+    _head_side(d, body_cx + 40, body_cy - 20, 21)
+    return _downsample(img)
+
+
+def _draw_swipe(phase: float) -> Image.Image:
+    """One-shot paw-swipe gesture, played when an app closes."""
+    img = _new_frame()
+    d = ImageDraw.Draw(img)
+    swipe = math.sin(phase * math.pi)  # 0 -> 1 -> 0 across the gesture
+    body_cx, body_cy = 62, 98
+
+    _line(d, [(body_cx - 28, body_cy - 2), (body_cx - 48, body_cy - 18), (body_cx - 54, body_cy - 38)],
+          FUR_DARK, 8)
+    _leg(d, (body_cx - 16, body_cy + 8), body_cx - 16, GROUND_Y, 6, 6)
+    _ellipse(d, body_cx, body_cy, 34, 19, fill=FUR)
+    _ellipse(d, body_cx + 2, body_cy + 5, 22, 11, fill=CREAM)
+    paw_x = body_cx + 26 + swipe * 14  # extended front paw, swiping down-forward
+    paw_y = body_cy + 4 + swipe * 16
+    _line(d, [(body_cx + 22, body_cy + 4), (paw_x, paw_y)], FUR_DARK, 6.5)
+    _ellipse(d, paw_x, paw_y, 6.5, 5.5, fill=CREAM, outline=FUR_DARK, width=2)
+    _leg(d, (body_cx + 30, body_cy + 8), body_cx + 30, GROUND_Y, 5.5, 5.5)
+    _head_side(d, body_cx + 40, body_cy - 20, 21, blush=True)
+    return _downsample(img)
+
+
+_ONE_SHOT_POSES = {"jump": _draw_jump, "swipe": _draw_swipe}
+
+
 def draw_cat(pose: str, phase: float, face_left: bool) -> Image.Image:
     """Draw one animation frame of the cat.
 
-    pose: 'idle' | 'walk' | 'sit' | 'sleep'
-    phase: 0..1 animation phase (walk cycle / breathing/ blink timing)
+    pose: 'idle' | 'walk' | 'sit' | 'sleep' | 'jump' | 'swipe'
+    phase: 0..1 animation phase (walk cycle / breathing / blink timing, or
+           position along a one-shot action for 'jump'/'swipe')
     face_left: mirror horizontally (walking left, or just a facing choice
                for the stationary poses)
     """
-    if pose == "walk":
+    if pose in _ONE_SHOT_POSES:
+        img = _ONE_SHOT_POSES[pose](phase)
+    elif pose == "walk":
         img = _draw_walk(phase)
     elif pose == "sit":
         img = _draw_sit(phase)
@@ -437,6 +491,174 @@ def list_visible_windows() -> list[tuple[int, str]]:
 
 
 # ---------------------------------------------------------------------------
+# Dynamic app index — everything Windows itself considers "installed", with
+# fuzzy "did you mean" resolution. No curated/hardcoded app list.
+# ---------------------------------------------------------------------------
+
+def _normalize_app_name(name: str) -> str:
+    name = name.lower().strip()
+    name = re.sub(r"[^a-z0-9 ]+", " ", name)
+    return re.sub(r"\s+", " ", name).strip()
+
+
+class AppIndex:
+    """Every app Windows' own Start menu knows about, resolved by name.
+
+    Built from `Get-StartApps` (a built-in PowerShell cmdlet — it's the same
+    list backing Start menu search, so it covers classic desktop apps *and*
+    Store/UWP apps uniformly, each with an AppID that `explorer.exe
+    shell:AppsFolder\\<AppID>` launches regardless of app type). Falls back
+    to the registry's App Paths key if PowerShell is ever unavailable.
+
+    Built once in a background thread at startup (Get-StartApps takes on
+    the order of ~0.5s) so `resolve()` on the UI thread is just a dict
+    lookup, never a blocking subprocess call.
+    """
+
+    REFRESH_SECONDS = 600
+
+    def __init__(self):
+        self._apps: dict[str, dict] = {}  # normalized name -> {name, kind, value}
+        self._lock = threading.Lock()
+        self.ready = threading.Event()
+
+    def start(self):
+        threading.Thread(target=self._build_loop, daemon=True).start()
+
+    def _build_loop(self):
+        while True:
+            self.refresh_now()
+            time.sleep(self.REFRESH_SECONDS)
+
+    def refresh_now(self):
+        apps: dict[str, dict] = {}
+        try:
+            apps.update(self._from_powershell())
+        except Exception as exc:  # noqa: BLE001
+            print(f"[app-index] Get-StartApps unavailable ({exc}); falling back to registry App Paths.")
+        if not apps:
+            try:
+                apps.update(self._from_app_paths())
+            except Exception as exc:  # noqa: BLE001
+                print(f"[app-index] registry fallback also failed ({exc}).")
+        if apps:
+            with self._lock:
+                self._apps = apps
+            self.ready.set()
+            print(f"[app-index] indexed {len(apps)} installed apps.")
+        else:
+            print("[app-index] found no apps at all — open-by-name will report 'not found' until this recovers.")
+
+    def _from_powershell(self) -> dict[str, dict]:
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Get-StartApps | ConvertTo-Json -Compress"],
+            capture_output=True, text=True, timeout=20, creationflags=creationflags,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            raise RuntimeError(proc.stderr.strip() or "empty output from Get-StartApps")
+        data = json.loads(proc.stdout)
+        if isinstance(data, dict):
+            data = [data]
+        out = {}
+        for item in data:
+            name = (item.get("Name") or "").strip()
+            app_id = (item.get("AppID") or "").strip()
+            if not name or not app_id:
+                continue
+            out[_normalize_app_name(name)] = {"name": name, "kind": "startapp", "value": app_id}
+        return out
+
+    def _from_app_paths(self) -> dict[str, dict]:
+        import winreg
+        out = {}
+        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            try:
+                key = winreg.OpenKey(root, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths")
+            except OSError:
+                continue
+            i = 0
+            while True:
+                try:
+                    sub = winreg.EnumKey(key, i)
+                except OSError:
+                    break
+                i += 1
+                try:
+                    with winreg.OpenKey(key, sub) as sk:
+                        path, _ = winreg.QueryValueEx(sk, None)
+                except OSError:
+                    continue
+                name = sub[:-4] if sub.lower().endswith(".exe") else sub
+                out[_normalize_app_name(name)] = {"name": name, "kind": "path", "value": path}
+        return out
+
+    def resolve(self, query: str):
+        """Resolve a typed app name.
+
+        Returns ("exact", entry) | ("fuzzy", entry) | ("none", [suggestion names]).
+        "fuzzy" means a plausible typo match ("chrom" -> "Chrome") — the
+        caller should confirm with the user before launching it.
+        """
+        query = query.strip()
+        # A literal path or existing file bypasses the index entirely.
+        if os.path.isabs(query) and os.path.isfile(query):
+            return "exact", {"name": os.path.basename(query), "kind": "path", "value": query}
+
+        self.ready.wait(timeout=5)
+        with self._lock:
+            apps = dict(self._apps)
+        if not apps:
+            return "none", []
+
+        nq = _normalize_app_name(query)
+        if nq in apps:
+            return "exact", apps[nq]
+
+        substr_hits = [v for k, v in apps.items() if nq in k or k in nq]
+        if substr_hits:
+            substr_hits.sort(key=lambda v: len(v["name"]))  # shortest/most-specific name wins
+            return "exact", substr_hits[0]
+
+        # Fuzzy against full names ("chrom" ~ "google chrome") — but a typo'd
+        # single word compared against a multi-word name scores badly on
+        # length alone ("chrme" vs "google chrome"), so also fuzzy-match
+        # against each individual word ("chrme" ~ "chrome").
+        word_map: dict[str, dict] = {}
+        for k, v in apps.items():
+            for word in k.split():
+                if word not in word_map or len(v["name"]) < len(word_map[word]["name"]):
+                    word_map[word] = v
+
+        close = difflib.get_close_matches(nq, apps.keys(), n=1, cutoff=0.6)
+        if close:
+            return "fuzzy", apps[close[0]]
+        close_words = difflib.get_close_matches(nq, word_map.keys(), n=1, cutoff=0.6)
+        if close_words:
+            return "fuzzy", word_map[close_words[0]]
+
+        weak = difflib.get_close_matches(nq, list(apps.keys()) + list(word_map.keys()), n=3, cutoff=0.3)
+        seen, suggestions = set(), []
+        for k in weak:
+            entry = apps.get(k) or word_map.get(k)
+            if entry and entry["name"] not in seen:
+                seen.add(entry["name"])
+                suggestions.append(entry["name"])
+        return "none", suggestions
+
+    @staticmethod
+    def launch(entry: dict):
+        if entry["kind"] == "startapp":
+            subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{entry['value']}"])
+        else:
+            path = entry["value"]
+            if os.path.isabs(path):
+                subprocess.Popen([path])
+            else:
+                subprocess.Popen(path, shell=True)
+
+
+# ---------------------------------------------------------------------------
 # Optional free-LLM command interpreter (OpenRouter / Cloudflare Workers AI)
 # ---------------------------------------------------------------------------
 
@@ -551,6 +773,10 @@ class PetState:
     idle_until: float = 0.0
     dragging: bool = False
     idle_walk_cycles: int = 0
+    # one-shot action overlay (jump/swipe), preempts normal pose/movement
+    action: str | None = None
+    action_phase: float = 0.0
+    action_duration: float = 0.9
 
 
 class PawmatePrototype:
@@ -579,6 +805,9 @@ class PawmatePrototype:
         self.state = PetState(x=float(start_x), y=float(start_y))
         self.desktop_icons: list[tuple[int, int]] = []
         self.image_id = self.canvas.create_image(CAT_SIZE // 2, CAT_SIZE // 2, image=None)
+
+        self.app_index = AppIndex()
+        self.app_index.start()
 
         self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
         self.canvas.bind("<B1-Motion>", self._on_drag_move)
@@ -693,19 +922,20 @@ class PawmatePrototype:
         self.state.pose = "idle"
 
     # -- right-click menu --
+    #
+    # Deliberately NOT a static list of apps to launch — that's just a worse
+    # Start menu. Opening an app goes through chat/the resolver below, which
+    # knows about every app Windows itself knows about and asks "did you
+    # mean X?" on a typo instead of failing. Close App stays as a live menu
+    # here because it shows *running* windows, which Start Menu can't — that
+    # is genuinely different information, not a duplicate control.
     def _on_right_click(self, event):
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="🐈 Pawmate prototype", state="disabled")
         menu.add_separator()
         menu.add_command(label="Chat / command…", command=self._open_chat)
+        menu.add_command(label="Open app…", command=self._prompt_open_app)
         menu.add_separator()
-
-        open_menu = tk.Menu(menu, tearoff=0)
-        for label, cmd in CURATED_APPS.items():
-            open_menu.add_command(label=label, command=lambda c=cmd: self._open_app(c))
-        open_menu.add_separator()
-        open_menu.add_command(label="Browse for .exe…", command=self._open_app_browse)
-        menu.add_cascade(label="Open App", menu=open_menu)
 
         close_menu = tk.Menu(menu, tearoff=0)
         windows = list_visible_windows()
@@ -734,39 +964,76 @@ class PawmatePrototype:
         if pose == "walk":
             self._pick_new_target()
 
-    # -- app open/close --
-    def _open_app(self, cmd: str):
+    # -- app open (dynamic index + fuzzy "did you mean") --
+    def _prompt_open_app(self):
+        query = simpledialog.askstring("Pawmate", "Open which app?", parent=self.root)
+        if query:
+            self._open_app_query(query)
+
+    def _open_app_query(self, query: str):
+        query = query.strip()
+        if not query:
+            return
+        kind, payload = self.app_index.resolve(query)
+        if kind == "exact":
+            self._launch_resolved(payload)
+        elif kind == "fuzzy":
+            name = payload["name"]
+            if messagebox.askyesno("Pawmate", f'No app called "{query}" — did you mean "{name}"?'):
+                self._launch_resolved(payload)
+        else:  # "none"
+            suggestions = payload
+            msg = f'No app found matching "{query}".'
+            if suggestions:
+                msg += "\nClosest matches: " + ", ".join(suggestions)
+            elif not self.app_index.ready.is_set():
+                msg += "\n(still indexing installed apps — try again in a moment)"
+            messagebox.showinfo("Pawmate", msg)
+
+    def _launch_resolved(self, entry: dict):
         try:
-            if cmd.startswith("start "):
-                os.system(cmd)
-            else:
-                subprocess.Popen(cmd, shell=False)
+            self.app_index.launch(entry)
+            self._play_action("jump")
         except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Pawmate", f"Couldn't open that app:\n{exc}")
+            messagebox.showerror("Pawmate", f'Couldn\'t open "{entry["name"]}":\n{exc}')
 
-    def _open_app_browse(self):
-        path = filedialog.askopenfilename(title="Choose an app to open",
-                                           filetypes=[("Executables", "*.exe"), ("All files", "*.*")])
-        if path:
-            self._open_app(path)
-
+    # -- app close (live running windows, confirm, fuzzy match) --
     def _close_app_confirm(self, hwnd: int, title: str):
         # Destructive action = human click, per the plan's principle.
         if not messagebox.askyesno("Pawmate — confirm", f'Close "{title}"?'):
             return
         try:
             win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+            self._play_action("swipe")
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Pawmate", f"Couldn't close that window:\n{exc}")
 
     def _close_app_by_title_substring(self, substring: str):
-        substring = substring.strip().lower()
-        matches = [(h, t) for h, t in list_visible_windows() if substring in t.lower()]
-        if not matches:
-            messagebox.showinfo("Pawmate", f'No open window matching "{substring}".')
+        substring = substring.strip()
+        if not substring:
             return
-        hwnd, title = matches[0]
-        self._close_app_confirm(hwnd, title)
+        open_windows = list_visible_windows()
+        lower = substring.lower()
+        exact = [(h, t) for h, t in open_windows if lower in t.lower()]
+        if exact:
+            self._close_app_confirm(*exact[0])
+            return
+        # no substring hit — offer the closest open window title as a "did you mean"
+        titles = {t: h for h, t in open_windows}
+        close = difflib.get_close_matches(substring, titles.keys(), n=1, cutoff=0.5)
+        if close:
+            title = close[0]
+            if messagebox.askyesno("Pawmate", f'No open window matching "{substring}" — did you mean "{title}"?'):
+                self._close_app_confirm(titles[title], title)
+            return
+        messagebox.showinfo("Pawmate", f'No open window matching "{substring}".')
+
+    # -- one-shot action animation (jump on open, swipe on close) --
+    def _play_action(self, name: str, duration: float = 0.9):
+        st = self.state
+        st.action = name
+        st.action_phase = 0.0
+        st.action_duration = duration
 
     # -- chat / command bar --
     def _open_chat(self):
@@ -793,8 +1060,7 @@ class PawmatePrototype:
         if kind == "pose" and target in ("walk", "sit", "sleep", "idle"):
             self._set_pose(target)
         elif kind == "open_app":
-            cmd = CURATED_APPS.get(target.title(), target)
-            self._open_app(cmd)
+            self._open_app_query(target)
         elif kind == "close_app":
             self._close_app_by_title_substring(target)
         elif kind == "say":
@@ -808,6 +1074,21 @@ class PawmatePrototype:
         dt = now - self._tick_last
         self._tick_last = now
         st = self.state
+
+        if st.action:
+            # a one-shot action (jump/swipe) preempts normal movement/pose
+            # entirely until it finishes, then falls back to idle
+            st.action_phase += dt / st.action_duration
+            if st.action_phase >= 1.0:
+                st.action = None
+                st.pose = "idle"
+                st.idle_until = now + random.uniform(IDLE_MIN_S, IDLE_MAX_S)
+            else:
+                img = self.sprites.get(st.action, st.action_phase, st.facing_left)
+                self.canvas.itemconfig(self.image_id, image=img)
+                self._current_image_ref = img
+                self.root.after(TICK_MS, self._tick)
+                return
 
         if not st.dragging:
             if st.pose == "walk" and st.target is not None:
