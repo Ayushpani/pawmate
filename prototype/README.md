@@ -90,6 +90,18 @@ With either set, double-click the cat and type something like *"open the
 calculator"* or *"close notepad for me"* — free text, not just the fixed
 command words.
 
+## If you see nothing at all (blank desktop, no cat)
+
+There's console output printed by `_apply_win32_styles` right after startup —
+look for a line starting `[win32-style]`. If it says `FAILED`, the error
+message tells you what broke. If it says `applied to hwnd=...`, the window
+styling itself worked; paste both that line and what you're seeing (or not
+seeing) and I can narrow it down further. A cat should already be visible
+*before* that line prints, since the first frame is now drawn immediately on
+startup rather than waiting for the first animation tick — if it's not there
+even for that first instant, the issue is likely in Tk's `-transparentcolor`
+setup itself rather than the later Win32 styling pass.
+
 ## Known rough edges (expected — this is a spike, not the product)
 
 - **Desktop-icon walking** depends on reading Explorer's `SysListView32`

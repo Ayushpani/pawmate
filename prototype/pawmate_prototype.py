@@ -412,21 +412,27 @@ def list_visible_windows() -> list[tuple[int, str]]:
         return results
 
     def cb(hwnd, _):
-        if not win32gui.IsWindowVisible(hwnd):
-            return True
-        title = win32gui.GetWindowText(hwnd)
-        if not title:
-            return True
-        # skip our own cat window and common shell/system windows
-        if title in ("Program Manager", "Pawmate"):
-            return True
-        exstyle = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-        if exstyle & win32con.WS_EX_TOOLWINDOW:
-            return True
-        results.append((hwnd, title))
+        try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            title = win32gui.GetWindowText(hwnd)
+            if not title:
+                return True
+            # skip our own cat window and common shell/system windows
+            if title in ("Program Manager", "Pawmate"):
+                return True
+            exstyle = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+            if exstyle & win32con.WS_EX_TOOLWINDOW:
+                return True
+            results.append((hwnd, title))
+        except Exception as exc:  # noqa: BLE001 - a window can vanish mid-enumeration; never crash the pet
+            print(f"[list-windows] skipped a window ({exc})")
         return True
 
-    win32gui.EnumWindows(cb, None)
+    try:
+        win32gui.EnumWindows(cb, None)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[list-windows] EnumWindows failed ({exc})")
     return results
 
 
@@ -580,6 +586,12 @@ class PawmatePrototype:
         self.canvas.bind("<Button-3>", self._on_right_click)
         self.canvas.bind("<Double-Button-1>", lambda e: self._open_chat())
 
+        # paint the very first frame immediately instead of waiting for the
+        # first _tick() ~33ms later, so there's never a blank-canvas window
+        initial = self.sprites.get(self.state.pose, 0.0, self.state.facing_left)
+        self.canvas.itemconfig(self.image_id, image=initial)
+        self._current_image_ref = initial
+
         self.root.after(200, self._apply_win32_styles)
         self.root.after(500, self._refresh_desktop_icons)
         self._pick_new_target()
@@ -588,17 +600,53 @@ class PawmatePrototype:
 
         self._drag_offset = (0, 0)
 
+    def _resolve_toplevel_hwnd(self) -> int:
+        """Walk up the HWND parent chain to the real top-level window.
+
+        Tk's *root* window on Windows has a long-documented quirk where
+        winfo_id() doesn't always return the actual top-level HWND (unlike a
+        Toplevel). Walking GetParent() up until it hits 0 finds the true
+        top-level regardless of which Tk build/version we're running under.
+        """
+        hwnd = self.root.winfo_id()
+        seen = set()
+        while True:
+            parent = win32gui.GetParent(hwnd)
+            if not parent or parent in seen:
+                return hwnd
+            seen.add(parent)
+            hwnd = parent
+
     # -- window styling (no-focus-steal, always-on-top, click-through via colorkey) --
     def _apply_win32_styles(self):
         if not HAVE_WIN32:
             return
         try:
-            hwnd = self.root.winfo_id()
+            hwnd = self._resolve_toplevel_hwnd()
             exstyle = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
             exstyle |= win32con.WS_EX_LAYERED | win32con.WS_EX_TOOLWINDOW | win32con.WS_EX_NOACTIVATE
             win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, exstyle)
+
+            # Changing GWL_EXSTYLE on an already-layered window can silently
+            # drop the colorkey Tk set up for -transparentcolor, which makes
+            # the whole window paint nothing (not "opaque" — invisible).
+            # Re-assert it explicitly so that can never happen.
+            r, g, b = 255, 0, 255  # TRANSPARENT_KEY, #ff00ff
+            colorref = win32api.RGB(r, g, b)
+            win32gui.SetLayeredWindowAttributes(hwnd, colorref, 0, win32con.LWA_COLORKEY)
+
+            # Force Windows to recompute the frame/visuals after an exstyle change.
+            win32gui.SetWindowPos(
+                hwnd, 0, 0, 0, 0, 0,
+                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED,
+            )
+
+            rect = win32gui.GetWindowRect(hwnd)
+            print(f"[win32-style] applied to hwnd={hwnd:#x} class={win32gui.GetClassName(hwnd)!r} "
+                  f"rect={rect} exstyle={exstyle:#x}")
         except Exception as exc:  # noqa: BLE001
-            print(f"[win32-style] {exc}")
+            print(f"[win32-style] FAILED — window will likely stay click-through-only "
+                  f"with no OS-level no-activate/toolwindow behavior: {exc}")
 
     def _refresh_desktop_icons(self):
         self.desktop_icons = get_desktop_icon_positions()
