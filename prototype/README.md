@@ -13,6 +13,20 @@ stack. Plain Python, one file, no build step.
 > (with a console message) rather than crashing when unavailable. Run it on
 > your laptop and tell me what breaks — that's the fastest way to harden it.
 
+## Motion, not just art
+
+An earlier version swapped between named sprite poses but never actually
+*moved the window* during the jump/swipe actions — two static pictures
+flickering in place, which correctly read as a slideshow, not an animation.
+The walk cycle had the same root problem in a subtler form: the window
+glided at a normal speed but the leg-frames only swapped once every ~0.5s,
+so it visually skated instead of stepped. Both are now driven by real
+per-tick position math (`_tick`), verified with actual timestamps/positions
+outside Tk before being wired back in — see the commit history for the
+numbers. If it still looks wrong once you run it, it's specifically the
+*motion* I want to know about, separately from whether the sprite art itself
+looks right.
+
 ## What it does
 
 - Transparent, always-on-top, **click-through** overlay window (empty space

@@ -47,6 +47,7 @@ import ctypes
 import ctypes.wintypes as wt
 import difflib
 import json
+import math
 import os
 import random
 import re
@@ -72,7 +73,7 @@ try:
 except ImportError:
     HAVE_WIN32 = False
 
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageTk
 
 # ---------------------------------------------------------------------------
 # Config
@@ -83,6 +84,11 @@ TRANSPARENT_KEY = "#ff00ff"    # color-keyed as transparent by the OS
 FPS = 30
 TICK_MS = int(1000 / FPS)
 WALK_SPEED_PX_S = 90.0
+WALK_CYCLE_HZ = 3.2             # leg-frame swaps/sec while walking — has to be fast relative to
+                                 # WALK_SPEED_PX_S or the glide and the "steps" visually disagree
+IDLE_CYCLE_HZ = 0.5             # frame swaps/sec at rest (breathing-speed, not a slideshow)
+IDLE_BOB_PX = 2.5               # small vertical bob while idle/sit, so rest is never perfectly frozen
+JUMP_HEIGHT_PX = 40.0           # how high the window actually rises during the jump action
 IDLE_MIN_S, IDLE_MAX_S = 2.0, 5.0
 PAUSE_AT_TARGET_MIN_S, PAUSE_AT_TARGET_MAX_S = 1.5, 4.0
 SLEEP_AFTER_IDLE_CYCLES = 4     # after this many idle->walk loops with no user interaction, nap
@@ -122,8 +128,11 @@ _POSE_FRAMES: dict[str, list[tuple[int, int]]] = {
     "walk_e": [(4, 2), (5, 2)],
     "walk_n": [(5, 0), (6, 0)],
     "walk_s": [(6, 2), (7, 2)],
-    "jump": [(7, 3), (3, 2)],    # celebration flash, played on a successful app open
-    "swipe": [(0, 0), (1, 0)],   # paw-swipe gesture, played on app close
+    # crouch -> airborne -> landing; paired with real vertical window motion
+    # in _tick (swapping sprites alone has no sense of "up" — the window
+    # itself has to actually move for a jump to read as a jump)
+    "jump": [(2, 3), (7, 3), (3, 2)],
+    "swipe": [(1, 2), (0, 0), (1, 0)],   # reach -> swipe -> follow-through, on app close
 }
 
 try:
@@ -811,7 +820,7 @@ class PawmatePrototype:
     def _launch_resolved(self, entry: dict):
         try:
             self.app_index.launch(entry)
-            self._play_action("jump")
+            self._play_action("jump", duration=0.7)  # long enough for the arc to read as an arc
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Pawmate", f'Couldn\'t open "{entry["name"]}":\n{exc}')
 
@@ -822,7 +831,7 @@ class PawmatePrototype:
             return
         try:
             win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
-            self._play_action("swipe")
+            self._play_action("swipe", duration=0.45)  # a swipe is quick, not a slow flicker
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Pawmate", f"Couldn't close that window:\n{exc}")
 
@@ -894,14 +903,23 @@ class PawmatePrototype:
         st = self.state
 
         if st.action:
-            # a one-shot action (jump/swipe) preempts normal movement/pose
-            # entirely until it finishes, then falls back to idle
+            # A one-shot action (jump/swipe) preempts normal movement/pose
+            # entirely until it finishes. Swapping sprite frames alone has
+            # no sense of "up" — a jump needs the window to actually move,
+            # or it's just two pictures flickering in place. So: real
+            # vertical motion here, following a parabolic arc, exactly the
+            # way normal walking already moves the window horizontally.
             st.action_phase += dt / st.action_duration
             if st.action_phase >= 1.0:
                 st.action = None
                 st.pose = "idle"
                 st.idle_until = now + random.uniform(IDLE_MIN_S, IDLE_MAX_S)
+                self.root.geometry(f"+{int(st.x)}+{int(st.y)}")  # land exactly back on the ground line
             else:
+                y_offset = 0.0
+                if st.action == "jump":
+                    y_offset = math.sin(st.action_phase * math.pi) * JUMP_HEIGHT_PX
+                self.root.geometry(f"+{int(st.x)}+{int(st.y - y_offset)}")
                 img = self.sprites.get(st.action, st.action_phase, st.facing_left)
                 self.canvas.itemconfig(self.image_id, image=img)
                 self._current_image_ref = img
@@ -929,7 +947,6 @@ class PawmatePrototype:
                     else:
                         st.walk_dir = "walk_s" if dy > 0 else "walk_n"
                         st.facing_left = False
-                    self.root.geometry(f"+{int(st.x)}+{int(st.y)}")
             elif st.pose == "idle" and st.target is None and now >= st.idle_until:
                 if st.idle_walk_cycles >= SLEEP_AFTER_IDLE_CYCLES:
                     st.pose = "sleep"
@@ -941,7 +958,20 @@ class PawmatePrototype:
                 st.pose = "idle"
                 st.idle_until = now + random.uniform(IDLE_MIN_S, IDLE_MAX_S)
 
-        st.phase = (st.phase + dt * (0.9 if st.pose == "walk" else 0.25)) % 1.0
+            # Walking's leg-frames need to cycle fast relative to how fast
+            # the window glides, or the two motions visually disagree and
+            # it reads as skating on ice instead of stepping. Idle/sit get
+            # a small vertical bob for the same reason at rest: two frames
+            # swapped only once every couple of seconds, with the window
+            # otherwise perfectly still, looks like a slideshow, not a cat.
+            if st.pose == "walk":
+                st.phase = (st.phase + dt * WALK_CYCLE_HZ) % 1.0
+                bob = 0.0
+            else:
+                st.phase = (st.phase + dt * IDLE_CYCLE_HZ) % 1.0
+                bob = math.sin(st.phase * 2 * math.pi) * IDLE_BOB_PX if st.pose in ("idle", "sit") else 0.0
+            self.root.geometry(f"+{int(st.x)}+{int(st.y - bob)}")
+
         render_pose = st.walk_dir if st.pose == "walk" else st.pose
         img = self.sprites.get(render_pose, st.phase, st.facing_left)
         self.canvas.itemconfig(self.image_id, image=img)
