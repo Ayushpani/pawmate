@@ -36,6 +36,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wt
 import json
+import math
 import os
 import random
 import subprocess
@@ -90,84 +91,208 @@ CURATED_APPS = {
 
 # ---------------------------------------------------------------------------
 # Cat sprite drawing (procedural, no external assets)
+#
+# Drawn front-on, chibi-proportioned (big head, small body) — this reads as
+# a recognizable, cute cat at the small sizes a desktop pet is rendered at,
+# which a thin side-profile silhouette does not. Everything is drawn at
+# SUPERSAMPLE x the final size and downscaled with LANCZOS for anti-aliased
+# edges, since PIL's ImageDraw has no native anti-aliasing.
+#
+# Every fill is fully opaque (alpha 255) except the transparent color key —
+# Tk's -transparentcolor does exact color-key matching, not alpha blending,
+# so any translucent pixel here would render wrong (a muddy blend against
+# whatever this script's own canvas happened to show) instead of the
+# blended-with-fur look you'd expect from a normal alpha compositor.
 # ---------------------------------------------------------------------------
 
-BODY = (232, 152, 58, 255)      # orange
-BODY_DARK = (196, 118, 40, 255)
-WHITE = (255, 250, 240, 255)
-BLACK = (30, 26, 24, 255)
-PINK = (230, 140, 150, 255)
+SUPERSAMPLE = 5
+
+FUR = (240, 165, 80, 255)
+FUR_DARK = (210, 128, 54, 255)
+CREAM = (255, 246, 227, 255)
+BLACK = (35, 30, 28, 255)
+PINK = (255, 176, 188, 255)
+PINK_SOFT = (255, 214, 222, 255)
+WHITE = (255, 255, 255, 255)
+NOSE = (232, 140, 150, 255)
+WHISKER = (120, 95, 80, 255)
+MAGENTA_OPAQUE = (255, 0, 255, 255)
+
+
+def _s(v: float) -> float:
+    return v * SUPERSAMPLE
 
 
 def _new_frame() -> Image.Image:
-    img = Image.new("RGBA", (CAT_SIZE, CAT_SIZE), (255, 0, 255, 255))
-    return img
+    big = CAT_SIZE * SUPERSAMPLE
+    return Image.new("RGBA", (big, big), MAGENTA_OPAQUE)
+
+
+def _downsample(img: Image.Image) -> Image.Image:
+    return img.resize((CAT_SIZE, CAT_SIZE), Image.LANCZOS)
+
+
+def _ellipse(d: ImageDraw.ImageDraw, cx, cy, rx, ry, **kw):
+    d.ellipse([_s(cx - rx), _s(cy - ry), _s(cx + rx), _s(cy + ry)], **kw)
+
+
+def _line(d: ImageDraw.ImageDraw, pts, fill, width):
+    d.line([(_s(x), _s(y)) for x, y in pts], fill=fill, width=int(_s(width)), joint="curve")
+
+
+def _ear(d: ImageDraw.ImageDraw, base_x, base_y, tip_x, tip_y, width, fill, inner=None):
+    dx, dy = tip_x - base_x, tip_y - base_y
+    length = math.hypot(dx, dy)
+    nx, ny = -dy / length, dx / length
+    p1 = (base_x - nx * width / 2, base_y - ny * width / 2)
+    p2 = (base_x + nx * width / 2, base_y + ny * width / 2)
+    d.polygon([(_s(p1[0]), _s(p1[1])), (_s(p2[0]), _s(p2[1])), (_s(tip_x), _s(tip_y))], fill=fill)
+    for p in (p1, p2):  # rounds the ear's base corners
+        _ellipse(d, p[0], p[1], width * 0.22, width * 0.22, fill=fill)
+    if inner:
+        ix, iy = base_x + dx * 0.34, base_y + dy * 0.34
+        iw = width * 0.4
+        ip1 = (ix - nx * iw / 2, iy - ny * iw / 2)
+        ip2 = (ix + nx * iw / 2, iy + ny * iw / 2)
+        tip2 = (tip_x - dx * 0.22, tip_y - dy * 0.22)
+        d.polygon([(_s(ip1[0]), _s(ip1[1])), (_s(ip2[0]), _s(ip2[1])), (_s(tip2[0]), _s(tip2[1]))], fill=inner)
+
+
+def _paw(d: ImageDraw.ImageDraw, cx, cy, r):
+    _ellipse(d, cx, cy, r, r * 0.75, fill=CREAM, outline=FUR_DARK, width=max(1, int(_s(r) * 0.18)))
+
+
+def _face(d: ImageDraw.ImageDraw, cx, cy, r, eyes_closed=False, blush=True):
+    _ear(d, cx - r * 0.58, cy - r * 0.52, cx - r * 0.92, cy - r * 1.55, r * 0.62, FUR_DARK, PINK)
+    _ear(d, cx + r * 0.58, cy - r * 0.52, cx + r * 0.92, cy - r * 1.55, r * 0.62, FUR_DARK, PINK)
+    _ellipse(d, cx, cy, r, r * 0.94, fill=FUR)  # head
+    _ellipse(d, cx - r * 0.8, cy + r * 0.32, r * 0.4, r * 0.32, fill=FUR)  # cheek fluff
+    _ellipse(d, cx + r * 0.8, cy + r * 0.32, r * 0.4, r * 0.32, fill=FUR)
+    _ellipse(d, cx, cy + r * 0.4, r * 0.6, r * 0.42, fill=CREAM)  # muzzle
+    for off in (-0.3, 0.0, 0.3):  # forehead tabby stripes
+        x = cx + off * r
+        _line(d, [(x, cy - r * 0.82), (x + off * r * 0.2, cy - r * 0.38)], FUR_DARK, r * 0.1)
+    if blush:
+        _ellipse(d, cx - r * 0.7, cy + r * 0.16, r * 0.2, r * 0.13, fill=PINK_SOFT)
+        _ellipse(d, cx + r * 0.7, cy + r * 0.16, r * 0.2, r * 0.13, fill=PINK_SOFT)
+    ex_off, ey = r * 0.34, cy - r * 0.02
+    eye_r = r * 0.28
+    for sx in (-1, 1):
+        ex = cx + sx * ex_off
+        if eyes_closed:
+            d.arc([_s(ex - eye_r * 0.9), _s(ey - eye_r * 0.35), _s(ex + eye_r * 0.9), _s(ey + eye_r * 0.55)],
+                  start=15, end=165, fill=BLACK, width=max(1, int(_s(r * 0.075))))
+        else:
+            _ellipse(d, ex, ey, eye_r * 0.6, eye_r, fill=BLACK)
+            _ellipse(d, ex - eye_r * 0.18, ey - eye_r * 0.4, eye_r * 0.22, eye_r * 0.26, fill=WHITE)
+            _ellipse(d, ex + eye_r * 0.2, ey + eye_r * 0.3, eye_r * 0.1, eye_r * 0.12, fill=WHITE)
+    nr = r * 0.1
+    ny = cy + r * 0.32
+    d.polygon([(_s(cx - nr), _s(ny - nr * 0.6)), (_s(cx + nr), _s(ny - nr * 0.6)), (_s(cx), _s(ny + nr * 0.7))],
+              fill=NOSE)
+    mw = r * 0.2
+    my = ny + nr * 0.7
+    d.arc([_s(cx - mw), _s(my - mw * 0.5), _s(cx), _s(my + mw * 0.9)], start=15, end=165, fill=BLACK,
+          width=int(_s(r * 0.05)))
+    d.arc([_s(cx), _s(my - mw * 0.5), _s(cx + mw), _s(my + mw * 0.9)], start=15, end=165, fill=BLACK,
+          width=int(_s(r * 0.05)))
+    for wy_off in (-0.06, 0.08, 0.22):
+        wy = cy + r * (0.4 + wy_off)
+        _line(d, [(cx - r * 0.6, wy), (cx - r * 1.15, wy - r * 0.05)], WHISKER, r * 0.03)
+        _line(d, [(cx + r * 0.6, wy), (cx + r * 1.15, wy - r * 0.05)], WHISKER, r * 0.03)
+
+
+def _draw_walk(phase: float) -> Image.Image:
+    img = _new_frame()
+    d = ImageDraw.Draw(img)
+    bob = math.sin(phase * 2 * math.pi) * 2.2
+    leg = math.sin(phase * 2 * math.pi) * 6
+    body_cx, body_cy = 70, 100 + bob * 0.4
+
+    tail_swing = math.sin(phase * 2 * math.pi) * 5
+    _line(d, [(body_cx + 30, body_cy - 2), (body_cx + 50, body_cy - 24 + tail_swing),
+              (body_cx + 42, body_cy - 46 + tail_swing)], FUR_DARK, 9)
+    _paw(d, body_cx - 14 - leg, body_cy + 26, 7)  # back paws
+    _paw(d, body_cx + 14 + leg, body_cy + 26, 7)
+    _ellipse(d, body_cx, body_cy, 32, 24, fill=FUR)  # body
+    _ellipse(d, body_cx, body_cy + 6, 21, 15, fill=CREAM)
+    _paw(d, body_cx - 16 + leg, body_cy + 24, 6.5)  # front paws
+    _paw(d, body_cx + 16 - leg, body_cy + 24, 6.5)
+    _face(d, body_cx, body_cy - 34 + bob * 0.6, 30)
+    return _downsample(img)
+
+
+def _draw_idle(phase: float, blink: bool) -> Image.Image:
+    img = _new_frame()
+    d = ImageDraw.Draw(img)
+    breathe = math.sin(phase * 2 * math.pi) * 1.2
+    body_cx, body_cy = 70, 102
+
+    tail_swish = math.sin(phase * 2 * math.pi * 0.6) * 4
+    _line(d, [(body_cx + 30, body_cy - 2), (body_cx + 48, body_cy - 22 + tail_swish),
+              (body_cx + 40, body_cy - 42 + tail_swish)], FUR_DARK, 9)
+    _paw(d, body_cx - 15, body_cy + 25, 7)
+    _paw(d, body_cx + 15, body_cy + 25, 7)
+    _ellipse(d, body_cx, body_cy - breathe * 0.15, 32 + breathe, 24 + breathe * 0.4, fill=FUR)
+    _ellipse(d, body_cx, body_cy + 6, 21, 15, fill=CREAM)
+    _face(d, body_cx, body_cy - 34 - breathe * 0.2, 30, eyes_closed=blink)
+    return _downsample(img)
+
+
+def _draw_sit(phase: float) -> Image.Image:
+    img = _new_frame()
+    d = ImageDraw.Draw(img)
+    breathe = math.sin(phase * 2 * math.pi) * 1.0
+    body_cx, body_cy = 70, 108
+
+    _line(d, [(body_cx + 28, body_cy - 6), (body_cx + 48, body_cy + 12), (body_cx + 36, body_cy + 30),
+              (body_cx + 14, body_cy + 26)], FUR_DARK, 8)
+    _ellipse(d, body_cx, body_cy, 34, 27, fill=FUR)
+    _ellipse(d, body_cx, body_cy + 5, 22, 18, fill=CREAM)
+    _paw(d, body_cx - 17, body_cy + 26, 7.5)
+    _paw(d, body_cx + 17, body_cy + 26, 7.5)
+    _face(d, body_cx, body_cy - 40 - breathe * 0.2, 31)
+    return _downsample(img)
+
+
+def _draw_sleep(phase: float) -> Image.Image:
+    img = _new_frame()
+    d = ImageDraw.Draw(img)
+    breathe = math.sin(phase * 2 * math.pi) * 1.0
+    cx, cy = 74, 104
+
+    _ellipse(d, cx, cy + breathe * 0.2, 44, 22 + breathe * 0.5, fill=FUR)  # curled loaf body
+    _ellipse(d, cx - 2, cy + 6, 28, 12, fill=CREAM)
+    d.arc([_s(cx - 34), _s(cy - 24), _s(cx + 38), _s(cy + 20)], start=195, end=345, fill=FUR_DARK, width=int(_s(7)))
+    _paw(d, cx - 20, cy + 16, 6.5)  # front paws tucked under chin
+    _paw(d, cx - 4, cy + 18, 6.5)
+    _face(d, cx - 32, cy - 14, 24, eyes_closed=True, blush=False)  # tucked head, reuses the standard face
+    zx, zy = cx + 34, cy - 34  # drifting "Zzz"
+    for i, sz_mult in enumerate((1.0, 0.78, 0.58)):
+        zxi, zyi = zx + i * 8, zy - i * 11
+        sz = 7 * sz_mult
+        d.line([(_s(zxi), _s(zyi)), (_s(zxi + sz), _s(zyi)), (_s(zxi), _s(zyi + sz)), (_s(zxi + sz), _s(zyi + sz))],
+               fill=WHISKER, width=max(1, int(_s(1.4 * sz_mult))), joint="curve")
+    return _downsample(img)
 
 
 def draw_cat(pose: str, phase: float, face_left: bool) -> Image.Image:
     """Draw one animation frame of the cat.
 
     pose: 'idle' | 'walk' | 'sit' | 'sleep'
-    phase: 0..1 animation phase (walk cycle / breathing)
-    face_left: mirror horizontally when walking left
+    phase: 0..1 animation phase (walk cycle / breathing/ blink timing)
+    face_left: mirror horizontally (walking left, or just a facing choice
+               for the stationary poses)
     """
-    img = _new_frame()
-    d = ImageDraw.Draw(img)
-    cx, cy = CAT_SIZE // 2, CAT_SIZE // 2
-
-    import math
-    bob = math.sin(phase * 2 * math.pi) * (3 if pose == "walk" else 1)
-    breathe = math.sin(phase * 2 * math.pi * (0.5 if pose != "sleep" else 0.35)) * 2
-
-    if pose == "sleep":
-        # curled ball on the ground, tail wrapped, eyes closed, "z" text
-        body_y = cy + 20
-        d.ellipse([cx - 34, body_y - 18 + breathe, cx + 34, body_y + 18 + breathe], fill=BODY, outline=BODY_DARK)
-        d.ellipse([cx - 16, body_y - 26 + breathe, cx + 14, body_y + 2 + breathe], fill=BODY, outline=BODY_DARK)
-        # ear
-        d.polygon([(cx - 8, body_y - 24 + breathe), (cx - 2, body_y - 36 + breathe), (cx + 4, body_y - 22 + breathe)], fill=BODY)
-        # closed eye
-        d.line([(cx - 4, body_y - 10 + breathe), (cx + 2, body_y - 10 + breathe)], fill=BLACK, width=2)
-        d.text((cx + 20, body_y - 40 + breathe), "z", fill=BLACK)
-        d.text((cx + 28, body_y - 50 + breathe), "z", fill=BLACK)
-        return img.transpose(Image.FLIP_LEFT_RIGHT) if face_left else img
-
-    if pose == "sit":
-        base_y = cy + 30
-        d.ellipse([cx - 26, base_y - 40, cx + 26, base_y + 6], fill=BODY, outline=BODY_DARK)  # body
-        head_y = base_y - 44 + breathe
-        d.ellipse([cx - 22, head_y - 22, cx + 22, head_y + 18], fill=BODY, outline=BODY_DARK)  # head
-        d.polygon([(cx - 18, head_y - 16), (cx - 10, head_y - 34), (cx - 2, head_y - 14)], fill=BODY)
-        d.polygon([(cx + 18, head_y - 16), (cx + 10, head_y - 34), (cx + 2, head_y - 14)], fill=BODY)
-        d.ellipse([cx - 10, head_y - 2, cx + 10, head_y + 12], fill=WHITE)  # muzzle
-        d.ellipse([cx - 10, head_y - 4, cx - 3, head_y + 4], fill=BLACK)   # eyes
-        d.ellipse([cx + 3, head_y - 4, cx + 10, head_y + 4], fill=BLACK)
-        d.polygon([(cx - 2, head_y + 2), (cx + 2, head_y + 2), (cx, head_y + 6)], fill=PINK)  # nose
-        d.arc([cx - 20, base_y - 30, cx + 30, base_y + 30], start=200, end=320, fill=BODY_DARK, width=4)  # tail
-        return img.transpose(Image.FLIP_LEFT_RIGHT) if face_left else img
-
-    # idle / walk: standing side profile
-    body_y = cy + bob
-    d.ellipse([cx - 38, body_y - 16, cx + 20, body_y + 16], fill=BODY, outline=BODY_DARK)  # body
-    head_x, head_y = cx + 18, body_y - 20
-    d.ellipse([head_x - 20, head_y - 18, head_x + 20, head_y + 18], fill=BODY, outline=BODY_DARK)  # head
-    d.polygon([(head_x - 14, head_y - 14), (head_x - 8, head_y - 32), (head_x + 2, head_y - 12)], fill=BODY)  # ear
-    d.polygon([(head_x + 6, head_y - 16), (head_x + 14, head_y - 30), (head_x + 20, head_y - 10)], fill=BODY)  # ear
-    d.ellipse([head_x + 6, head_y - 2, head_x + 22, head_y + 12], fill=WHITE)  # muzzle
-    eye_x = head_x + 10
-    d.ellipse([eye_x - 3, head_y - 4, eye_x + 3, head_y + 3], fill=BLACK)  # eye
-    d.polygon([(head_x + 18, head_y + 4), (head_x + 22, head_y + 4), (head_x + 20, head_y + 8)], fill=PINK)  # nose
-
-    # legs: two visible, offset for walk cycle
-    leg_phase = math.sin(phase * 2 * math.pi) * 10 if pose == "walk" else 0
-    d.rectangle([cx - 24 + leg_phase, body_y + 10, cx - 16 + leg_phase, body_y + 30], fill=BODY_DARK)
-    d.rectangle([cx - 4 - leg_phase, body_y + 10, cx + 4 - leg_phase, body_y + 30], fill=BODY_DARK)
-
-    # tail, swishes
-    tail_swish = math.sin(phase * 2 * math.pi * 1.3) * 12
-    d.line([(cx - 36, body_y), (cx - 52, body_y - 10 + tail_swish), (cx - 58, body_y - 26 + tail_swish)],
-           fill=BODY_DARK, width=6, joint="curve")
-
+    if pose == "walk":
+        img = _draw_walk(phase)
+    elif pose == "sit":
+        img = _draw_sit(phase)
+    elif pose == "sleep":
+        img = _draw_sleep(phase)
+    else:
+        # idle: brief blink once near the top of each phase loop
+        img = _draw_idle(phase, blink=phase < 0.06)
     return img.transpose(Image.FLIP_LEFT_RIGHT) if face_left else img
 
 
