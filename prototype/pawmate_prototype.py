@@ -91,6 +91,8 @@ STRIDE_PX = 34.0                # ground covered per full walk cycle; the animat
                                  # driven by distance/STRIDE_PX so paws can never skate
 IDLE_CYCLE_HZ = 0.5             # frame swaps/sec at rest (breathing-speed, not a slideshow)
 IDLE_BOB_PX = 2.5               # small vertical bob while idle/sit, so rest is never perfectly frozen
+WALK_BOB_PX = 2.5               # body bounce per footfall — with a low-frame-count sprite this is
+                                 # most of what separates "walking" from "a picture being dragged"
 JUMP_HEIGHT_PX = 40.0           # how high the window actually rises during the jump action
 IDLE_MIN_S, IDLE_MAX_S = 2.0, 5.0
 PAUSE_AT_TARGET_MIN_S, PAUSE_AT_TARGET_MAX_S = 1.5, 4.0
@@ -1242,7 +1244,10 @@ class PawmatePrototype:
             # feet and ground can never disagree.
             if st.pose == "walk":
                 st.phase = (st.phase + moved / STRIDE_PX) % 1.0
-                bob = 0.0
+                # One bounce per footfall (two per stride cycle), driven by the
+                # same distance-synced phase as the legs, so the bounce lands
+                # with the steps instead of drifting against them.
+                bob = abs(math.sin(st.phase * 2 * math.pi)) * WALK_BOB_PX
             else:
                 st.phase = (st.phase + dt * IDLE_CYCLE_HZ) % 1.0
                 bob = math.sin(st.phase * 2 * math.pi) * IDLE_BOB_PX if st.pose in ("idle", "sit") else 0.0
