@@ -13,32 +13,88 @@ stack. Plain Python, one file, no build step.
 > (with a console message) rather than crashing when unavailable. Run it on
 > your laptop and tell me what breaks — that's the fastest way to harden it.
 
+## Using your own cat sprites (recommended)
+
+The bundled fallback sprite only has **2 frames per animation**, which can
+never look smooth — that's a hard ceiling, not a tuning problem. Drop in a
+real sprite pack and it'll use every frame the artist drew.
+
+The sandbox this was built in has `itch.io` and `opengameart.org` blocked by
+its network proxy, so the pack has to be downloaded on your machine. Good
+free options:
+
+- https://carysaurus.itch.io/black-cat-sprites
+- https://frolicforge.itch.io/cat-animation-high-res
+
+**Steps:**
+
+1. Download and unzip the pack.
+2. Put the animation files into `prototype/assets/cat/`. Any of these
+   layouts works — no renaming needed in most cases:
+
+   ```
+   assets/cat/walk/0.png, 1.png, ...     <- a folder per animation
+   assets/cat/idle/0.png, ...
+
+   assets/cat/walk.png                   <- OR a horizontal strip per animation
+   assets/cat/idle.png
+   ```
+
+3. Check what it found:
+
+   ```powershell
+   python pawmate_prototype.py --inspect
+   ```
+
+   That prints each animation and its frame count, and writes
+   `assets/contact_sheet.png` — a labeled grid of every loaded frame, so you
+   can confirm nothing got mis-sliced before running for real.
+
+4. Run normally. Frame counts are picked up automatically.
+
+It recognises common names case-insensitively (`Walk`, `walking`, `Cat_Run`,
+`sleep`, `Sitting`, …) — see `_ANIM_ALIASES` in the source. If your pack uses
+names it doesn't recognise, either rename the files/folders to `walk`,
+`idle`, `sit`, `sleep`, `jump`, or send me the `--inspect` output and I'll
+add the aliases.
+
+Strips are split on transparent gutters when present, otherwise by assuming
+square frames (width being an exact multiple of height). Non-square frames
+are letterboxed with the feet aligned to the bottom, so a cat isn't left
+floating.
+
 ## Motion, not just art
 
-An earlier version swapped between named sprite poses but never actually
-*moved the window* during the jump/swipe actions — two static pictures
-flickering in place, which correctly read as a slideshow, not an animation.
-The walk cycle had the same root problem in a subtler form: the window
-glided at a normal speed but the leg-frames only swapped once every ~0.5s,
-so it visually skated instead of stepped. Both are now driven by real
-per-tick position math (`_tick`), verified with actual timestamps/positions
-outside Tk before being wired back in — see the commit history for the
-numbers. If it still looks wrong once you run it, it's specifically the
-*motion* I want to know about, separately from whether the sprite art itself
-looks right.
+Three separate things were making it read as a slideshow rather than an
+animal, and they had different fixes:
+
+1. **Actions had no motion at all.** Jump/swipe swapped sprite frames with
+   the window standing perfectly still — two pictures flickering. The jump
+   now physically moves the window through a parabolic arc.
+2. **The walk skated.** The window glided smoothly while the leg-frames
+   swapped on a wall-clock timer, so feet and ground disagreed. The walk
+   cycle is now advanced by **distance travelled** (`distance / STRIDE_PX`),
+   which makes skating structurally impossible: however fast the cat is
+   moving, including mid-acceleration, the paws advance exactly one stride
+   per stride-length of ground covered.
+3. **It drifted diagonally across the middle of the screen.** Cats walk on
+   surfaces. The cat now lives on the **floor** (the bottom of the work
+   area, so it stands on the taskbar rather than behind it) and only walks
+   horizontally, easing in and braking to a stop rather than snapping
+   between full speed and zero.
+
+The remaining limit is frame count — see "Using your own cat sprites" above.
 
 ## What it does
 
 - Transparent, always-on-top, **click-through** overlay window (empty space
   passes clicks through to whatever's beneath; the cat itself is clickable)
-- A **real cat sprite** — the classic "Neko" desktop-pet pixel art (see
-  `assets/CREDIT.md` for provenance/license). Two from-scratch hand-drawn
-  attempts at a procedural cat didn't actually read as a cat at this size;
-  this uses real art instead of more geometry guesswork. Idle / sit /
-  sleep / 4-directional walk, plus a **jump** celebration on a successful
-  app open and a **paw-swipe** gesture on app close.
-- Wanders the screen, and — best-effort — walks between your **real desktop
-  icon positions**, pausing at each one, so it visibly "visits your folders"
+- **Whatever sprite pack you drop in** (see above), or a bundled 2-frame
+  fallback if you haven't. Idle / sit / sleep / walk, plus a **jump**
+  celebration on a successful app open and a **paw-swipe** on app close.
+- **Walks along the floor**, horizontally, at an unhurried pace — easing
+  into a walk and braking to a stop, pausing to sit or nap. It does not
+  drift diagonally across the middle of your desktop.
 - **Drag** to pick it up and move it
 - **Open any installed app by name through chat** — resolved dynamically
   against everything Windows' own Start menu knows about (via
@@ -76,8 +132,8 @@ pip install -r requirements.txt
 python pawmate_prototype.py
 ```
 
-A cat should appear near the center of your screen within a second or two,
-start wandering, and (if it can find your desktop icons) start visiting them.
+A cat should appear standing on your taskbar within a second or two and
+start strolling along it.
 
 ### Try it
 

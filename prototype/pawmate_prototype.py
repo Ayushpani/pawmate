@@ -83,9 +83,12 @@ CAT_SIZE = 128                 # window / sprite size in px — 4x the sprite sh
 TRANSPARENT_KEY = "#ff00ff"    # color-keyed as transparent by the OS
 FPS = 30
 TICK_MS = int(1000 / FPS)
-WALK_SPEED_PX_S = 90.0
-WALK_CYCLE_HZ = 3.2             # leg-frame swaps/sec while walking — has to be fast relative to
-                                 # WALK_SPEED_PX_S or the glide and the "steps" visually disagree
+WALK_SPEED_PX_S = 48.0          # an unhurried, deliberate walk — not a scurry across the screen
+WALK_MIN_SPEED_PX_S = 10.0
+WALK_ACCEL_PX_S2 = 90.0         # ease in/out of walks instead of snapping to full speed
+WALK_EASE_PX = 55.0             # start braking this far from the destination
+STRIDE_PX = 34.0                # ground covered per full walk cycle; the animation phase is
+                                 # driven by distance/STRIDE_PX so paws can never skate
 IDLE_CYCLE_HZ = 0.5             # frame swaps/sec at rest (breathing-speed, not a slideshow)
 IDLE_BOB_PX = 2.5               # small vertical bob while idle/sit, so rest is never perfectly frozen
 JUMP_HEIGHT_PX = 40.0           # how high the window actually rises during the jump action
@@ -100,95 +103,258 @@ CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "").strip()
 CF_MODEL = os.environ.get("CF_MODEL", "@cf/meta/llama-3.1-8b-instruct")
 
 # ---------------------------------------------------------------------------
-# Cat sprite — real pixel art, not hand-drawn primitives.
+# Cat sprite loading.
 #
-# Two from-scratch attempts at drawing a cat out of ellipses/polygons both
-# came out looking wrong (a front-facing "chibi blob," then a side-profile
-# that still didn't read as a cat at this size) — geometry-by-guesswork
-# doesn't converge on "obviously a cat" the way an artist's actual drawing
-# does. So: this uses the classic "Neko" desktop-pet sprite instead (see
-# assets/CREDIT.md for provenance/license) — small (32x32), hand-drawn,
-# instantly recognizable, and it's specifically *designed* for this exact
-# job (a screen-roaming desktop cat) since 1989.
+# Drop-in artist-made art is the goal: a 2-frame-per-pose sheet can't look
+# smooth no matter how the playback is tuned, and hand-drawing a convincing
+# cat out of primitives didn't work either (two attempts, both wrong). So
+# this loads whatever sprite pack you put in assets/cat/, handling the three
+# layouts asset packs actually ship in:
 #
-# The sheet is 8 columns x 4 rows of 32x32 frames. Poses below were picked
-# by rendering the whole grid, labeling every cell, and looking at it —
-# not by trusting a half-remembered mapping.
+#   1. assets/cat/<anim>/frame0.png, frame1.png, ...   (folder per animation)
+#   2. assets/cat/<anim>.png                           (horizontal strip)
+#   3. assets/cat/sheet.png + sheet.json               (grid, explicit map)
+#
+# Animation names it looks for, in preference order per pose, are in
+# _ANIM_ALIASES. Run `python pawmate_prototype.py --inspect` to see exactly
+# what got discovered and dump a labeled contact sheet to check the mapping.
+#
+# Falls back to the bundled oneko.gif (see assets/CREDIT.md) when no pack is
+# present, so the app always runs.
 # ---------------------------------------------------------------------------
 
 MAGENTA_OPAQUE = (255, 0, 255, 255)
-_SPRITE_SHEET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "oneko.gif")
-_FRAME_PX = 32
+_ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+_CAT_DIR = os.path.join(_ASSET_DIR, "cat")
+_ONEKO_PATH = os.path.join(_ASSET_DIR, "oneko.gif")
 
-# pose -> sequence of (column, row) cells in the sheet, alternated over phase 0..1
-_POSE_FRAMES: dict[str, list[tuple[int, int]]] = {
-    "idle": [(2, 2), (1, 1)],
-    "sit": [(4, 3), (1, 3)],
-    "sleep": [(2, 0), (2, 1)],
-    "walk_e": [(4, 2), (5, 2)],
-    "walk_n": [(5, 0), (6, 0)],
-    "walk_s": [(6, 2), (7, 2)],
-    # crouch -> airborne -> landing; paired with real vertical window motion
-    # in _tick (swapping sprites alone has no sense of "up" — the window
-    # itself has to actually move for a jump to read as a jump)
-    "jump": [(2, 3), (7, 3), (3, 2)],
-    "swipe": [(1, 2), (0, 0), (1, 0)],   # reach -> swipe -> follow-through, on app close
+# Logical pose -> candidate animation names in a downloaded pack (case/sep
+# insensitive). First one that exists wins.
+_ANIM_ALIASES: dict[str, list[str]] = {
+    "walk": ["walk", "walking", "walk_right", "run", "running", "move"],
+    "idle": ["idle", "idle_blink", "stand", "standing", "breathe"],
+    "sit": ["sit", "sitting", "sit_idle", "sitdown", "sit_down"],
+    "sleep": ["sleep", "sleeping", "lay", "laying", "lie", "lying", "rest"],
+    "jump": ["jump", "jumping", "pounce", "leap", "attack"],
+    "swipe": ["swipe", "scratch", "attack", "paw", "hit", "claw"],
+    "groom": ["groom", "grooming", "lick", "licking", "wash"],
 }
 
-try:
-    _sheet = Image.open(_SPRITE_SHEET_PATH).convert("RGBA")
-except FileNotFoundError:
-    _sheet = None
-    print(f"[sprite] missing {_SPRITE_SHEET_PATH!r} — the cat will not render. "
-          f"Re-clone/re-pull the repo so prototype/assets/oneko.gif comes along.")
-
-_frame_cache: dict[tuple[int, int], Image.Image] = {}
+_IMG_EXT = (".png", ".gif", ".webp", ".bmp")
 
 
-def _sprite_frame(col: int, row: int) -> Image.Image:
-    key = (col, row)
-    if key in _frame_cache:
-        return _frame_cache[key]
-    box = (col * _FRAME_PX, row * _FRAME_PX, (col + 1) * _FRAME_PX, (row + 1) * _FRAME_PX)
-    raw = _sheet.crop(box) if _sheet else Image.new("RGBA", (_FRAME_PX, _FRAME_PX), (0, 0, 0, 0))
-    # composite onto opaque magenta (colorkey transparency, not alpha — see
-    # the module docstring) with NEAREST upscaling to keep pixel art crisp
-    # instead of LANCZOS-blurring a 32px sprite into mush.
-    canvas = Image.new("RGBA", raw.size, MAGENTA_OPAQUE)
-    canvas.paste(raw, (0, 0), raw)
-    canvas = canvas.resize((CAT_SIZE, CAT_SIZE), Image.NEAREST)
-    _frame_cache[key] = canvas
+def _norm_name(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+
+def _to_colorkey(img: Image.Image, size: int) -> Image.Image:
+    """Composite onto opaque magenta and scale to `size`.
+
+    Tk's -transparentcolor is an exact color-key match, not alpha blending,
+    so every pixel must end up fully opaque: cat pixels keep their color,
+    everything else becomes the key color. Small source art is scaled with
+    NEAREST to stay crisp; large (hi-res) art with LANCZOS to stay smooth.
+    """
+    img = img.convert("RGBA")
+    # trim fully transparent margins so frames of differing padding align
+    bbox = img.getbbox()
+    canvas = Image.new("RGBA", img.size, MAGENTA_OPAQUE)
+    canvas.paste(img, (0, 0), img)
+    resample = Image.NEAREST if max(img.size) < 96 else Image.LANCZOS
+    if img.size != (size, size):
+        # letterbox into a square so non-square frames don't get distorted
+        w, h = img.size
+        scale = min(size / w, size / h)
+        new = (max(1, int(w * scale)), max(1, int(h * scale)))
+        scaled = canvas.resize(new, resample)
+        out = Image.new("RGBA", (size, size), MAGENTA_OPAQUE)
+        out.paste(scaled, ((size - new[0]) // 2, size - new[1]))  # feet on the bottom edge
+        return out
     return canvas
 
 
-def draw_cat(pose: str, phase: float, face_left: bool) -> Image.Image:
-    """Draw one animation frame of the cat.
+def _slice_strip(img: Image.Image) -> list[Image.Image]:
+    """Split a horizontal strip into frames.
 
-    pose: 'idle' | 'sit' | 'sleep' | 'walk_e' | 'walk_n' | 'walk_s' | 'jump' | 'swipe'
-    phase: 0..1, selects among that pose's frames (2 frames for a walk
-           cycle, or a jump/swipe's position through its one-shot gesture)
-    face_left: mirror horizontally — used for walk_e (becomes "walk west")
-               and as a general facing choice for the stationary poses
+    Prefers fully-transparent gutter columns (exact, handles uneven frames);
+    falls back to assuming square frames (width being an exact multiple of
+    height is the near-universal convention for strips).
     """
-    frames = _POSE_FRAMES.get(pose, _POSE_FRAMES["idle"])
-    idx = int(phase * len(frames)) % len(frames)
-    img = _sprite_frame(*frames[idx])
-    return img.transpose(Image.FLIP_LEFT_RIGHT) if face_left else img
+    w, h = img.size
+    alpha = img.convert("RGBA").split()[3]
+    cols = alpha.load()
+    empty = []
+    for x in range(w):
+        if all(cols[x, y] == 0 for y in range(0, h, max(1, h // 24))):
+            empty.append(x)
+    # group contiguous empty columns into gutters, cut at their midpoints
+    if empty and len(empty) < w * 0.9:
+        runs, start = [], empty[0]
+        for a, b in zip(empty, empty[1:]):
+            if b != a + 1:
+                runs.append((start, a))
+                start = b
+        runs.append((start, empty[-1]))
+        interior = [r for r in runs if r[0] > 0 and r[1] < w - 1]
+        if interior:
+            cuts = [0] + [(a + b) // 2 for a, b in interior] + [w]
+            frames = [img.crop((cuts[i], 0, cuts[i + 1], h)) for i in range(len(cuts) - 1)]
+            frames = [f for f in frames if f.getbbox()]
+            if len(frames) >= 2:
+                return frames
+    if w % h == 0 and w // h >= 2:
+        n = w // h
+        return [img.crop((i * h, 0, (i + 1) * h, h)) for i in range(n)]
+    return [img]
+
+
+class SpriteSource:
+    """Discovers and loads cat animations from assets/cat/, else oneko."""
+
+    def __init__(self, size: int):
+        self.size = size
+        self.anims: dict[str, list[Image.Image]] = {}
+        self.origin = "none"
+        self._load()
+
+    # -- discovery ---------------------------------------------------------
+    def _load(self):
+        if os.path.isdir(_CAT_DIR) and self._load_pack():
+            self.origin = f"pack:{_CAT_DIR}"
+        else:
+            self._load_oneko()
+            self.origin = "builtin:oneko.gif"
+        self._fill_gaps()
+
+    def _load_pack(self) -> bool:
+        found: dict[str, list[Image.Image]] = {}
+        entries = os.listdir(_CAT_DIR)
+        by_norm = {_norm_name(e): e for e in entries}
+
+        for pose, aliases in _ANIM_ALIASES.items():
+            for alias in aliases:
+                key = _norm_name(alias)
+                # 1. a folder of numbered frames
+                match = next((by_norm[n] for n in by_norm
+                              if n == key and os.path.isdir(os.path.join(_CAT_DIR, by_norm[n]))), None)
+                if match:
+                    d = os.path.join(_CAT_DIR, match)
+                    files = sorted(f for f in os.listdir(d) if f.lower().endswith(_IMG_EXT))
+                    frames = []
+                    for f in files:
+                        try:
+                            frames.append(Image.open(os.path.join(d, f)).convert("RGBA"))
+                        except Exception:  # noqa: BLE001
+                            pass
+                    if frames:
+                        found[pose] = frames
+                        break
+                # 2. a strip / single image
+                strip = next((by_norm[n] for n in by_norm
+                              if n.startswith(key) and by_norm[n].lower().endswith(_IMG_EXT)), None)
+                if strip:
+                    try:
+                        img = Image.open(os.path.join(_CAT_DIR, strip)).convert("RGBA")
+                    except Exception:  # noqa: BLE001
+                        continue
+                    frames = _slice_strip(img)
+                    if frames:
+                        found[pose] = frames
+                        break
+        if not found:
+            return False
+        self.anims = {k: [_to_colorkey(f, self.size) for f in v] for k, v in found.items()}
+        return True
+
+    def _load_oneko(self):
+        """Bundled fallback: 8x4 grid of 32px frames, 2 frames per pose."""
+        cells = {
+            "idle": [(2, 2), (1, 1)], "sit": [(4, 3), (1, 3)], "sleep": [(2, 0), (2, 1)],
+            "walk": [(4, 2), (5, 2)],
+            "jump": [(2, 3), (7, 3), (3, 2)], "swipe": [(1, 2), (0, 0), (1, 0)],
+        }
+        try:
+            sheet = Image.open(_ONEKO_PATH).convert("RGBA")
+        except FileNotFoundError:
+            print(f"[sprite] no pack in {_CAT_DIR} and {_ONEKO_PATH} is missing — nothing to draw.")
+            return
+        for pose, cs in cells.items():
+            self.anims[pose] = [
+                _to_colorkey(sheet.crop((c * 32, r * 32, (c + 1) * 32, (r + 1) * 32)), self.size)
+                for c, r in cs
+            ]
+
+    def _fill_gaps(self):
+        """Any pose the pack didn't provide falls back to something sensible."""
+        fallbacks = {"walk": "idle", "idle": "walk", "sit": "idle", "sleep": "sit",
+                     "jump": "walk", "swipe": "idle", "groom": "sit"}
+        for pose, alt in fallbacks.items():
+            if not self.anims.get(pose):
+                src = self.anims.get(alt) or next(iter(self.anims.values()), None)
+                if src:
+                    self.anims[pose] = src
+
+    # -- access ------------------------------------------------------------
+    def frame(self, pose: str, phase: float, face_left: bool) -> Image.Image:
+        frames = self.anims.get(pose) or self.anims.get("idle")
+        if not frames:
+            return Image.new("RGBA", (self.size, self.size), MAGENTA_OPAQUE)
+        idx = int(phase * len(frames)) % len(frames)
+        img = frames[idx]
+        return img.transpose(Image.FLIP_LEFT_RIGHT) if face_left else img
+
+    def frame_count(self, pose: str) -> int:
+        return len(self.anims.get(pose) or ())
+
+    def describe(self) -> str:
+        parts = ", ".join(f"{k}:{len(v)}f" for k, v in sorted(self.anims.items()))
+        return f"[sprite] source={self.origin} — {parts}"
+
+    def contact_sheet(self, path: str):
+        """Dump every loaded frame, labeled, so the mapping can be eyeballed."""
+        from PIL import ImageDraw as _ID
+        rows = [(k, v) for k, v in sorted(self.anims.items())]
+        if not rows:
+            return
+        cols = max(len(v) for _, v in rows)
+        pad = 16
+        sheet = Image.new("RGB", (cols * self.size, len(rows) * (self.size + pad)), (240, 240, 244))
+        d = _ID.Draw(sheet)
+        for r, (name, frames) in enumerate(rows):
+            y = r * (self.size + pad)
+            d.text((4, y + 3), f"{name}  ({len(frames)} frames)", fill=(0, 0, 0))
+            for c, f in enumerate(frames):
+                rgb = Image.new("RGB", f.size, (240, 240, 244))
+                rgb.paste(f.convert("RGB"), (0, 0))
+                sheet.paste(rgb, (c * self.size, y + pad))
+        sheet.save(path)
+
+
+SPRITES: SpriteSource | None = None  # initialised in main(), after CAT_SIZE is known
+
+
+def draw_cat(pose: str, phase: float, face_left: bool) -> Image.Image:
+    """One animation frame. pose: walk|idle|sit|sleep|jump|swipe|groom."""
+    return SPRITES.frame(pose, phase, face_left)
 
 
 class SpriteCache:
-    """Renders and caches PhotoImages per (pose, frame_index, facing)."""
+    """Caches PhotoImages per (pose, frame_index, facing).
 
-    def __init__(self, frames_per_pose: int = 12):
-        self.frames_per_pose = frames_per_pose
+    Quantises on each animation's *real* frame count rather than a fixed
+    number, so a pack shipping an 8-frame walk gets all 8 frames instead of
+    being resampled down to some arbitrary grid.
+    """
+
+    def __init__(self):
         self._cache: dict[tuple[str, int, bool], ImageTk.PhotoImage] = {}
 
     def get(self, pose: str, phase: float, face_left: bool) -> ImageTk.PhotoImage:
-        idx = int(phase * self.frames_per_pose) % self.frames_per_pose
+        n = max(1, SPRITES.frame_count(pose) or 1)
+        idx = int(phase * n) % n
         key = (pose, idx, face_left)
         if key not in self._cache:
-            frame_phase = idx / self.frames_per_pose
-            pil_img = draw_cat(pose, frame_phase, face_left)
+            pil_img = draw_cat(pose, (idx + 0.5) / n, face_left)
             self._cache[key] = ImageTk.PhotoImage(pil_img)
         return self._cache[key]
 
@@ -593,9 +759,9 @@ class PetState:
     y: float
     pose: str = "idle"
     facing_left: bool = False
-    walk_dir: str = "walk_e"  # which directional sprite to use while pose == "walk"
     phase: float = 0.0
-    target: tuple[float, float] | None = None
+    target_x: float | None = None     # cats walk along the floor, so only x is a destination
+    speed: float = 0.0                # current px/s, eased toward the target speed
     pause_until: float = 0.0
     idle_until: float = 0.0
     dragging: bool = False
@@ -630,6 +796,8 @@ class PawmatePrototype:
 
         self.sprites = SpriteCache()
         self.state = PetState(x=float(start_x), y=float(start_y))
+        self.state.y = self._floor_y()          # cats belong on a surface, not mid-screen
+        self.root.geometry(f"{CAT_SIZE}x{CAT_SIZE}+{int(self.state.x)}+{int(self.state.y)}")
         self.desktop_icons: list[tuple[int, int]] = []
         self.image_id = self.canvas.create_image(CAT_SIZE // 2, CAT_SIZE // 2, image=None)
 
@@ -713,18 +881,44 @@ class PawmatePrototype:
         # refresh occasionally in case the user rearranges icons
         self.root.after(60_000, self._refresh_desktop_icons)
 
+    # -- the floor --
+    def _floor_y(self) -> float:
+        """Top edge of the window when the cat is standing on the floor.
+
+        Uses the *work area* (SPI_GETWORKAREA), so the cat stands on top of
+        the taskbar rather than behind it.
+        """
+        screen_h = self.root.winfo_screenheight()
+        bottom = screen_h
+        if HAVE_WIN32:
+            try:
+                rect = wt.RECT()
+                if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+                    bottom = rect.bottom
+            except Exception:  # noqa: BLE001
+                pass
+        return float(bottom - CAT_SIZE)
+
     # -- movement targets --
     def _pick_new_target(self):
+        """Pick somewhere to walk *along the floor*.
+
+        Deliberately horizontal-only: a cat walks on a surface. Drifting
+        diagonally across the middle of the desktop is screensaver
+        behaviour, and it reads as annoying rather than alive.
+        """
         screen_w = self.root.winfo_screenwidth()
-        screen_h = self.root.winfo_screenheight()
-        if self.desktop_icons and random.random() < 0.7:
-            ix, iy = random.choice(self.desktop_icons)
-            tx = max(0, min(screen_w - CAT_SIZE, ix - CAT_SIZE // 2))
-            ty = max(0, min(screen_h - CAT_SIZE, iy - CAT_SIZE // 2))
-        else:
-            tx = random.uniform(0, screen_w - CAT_SIZE)
-            ty = random.uniform(0, screen_h - CAT_SIZE)
-        self.state.target = (tx, ty)
+        margin = 8
+        span = max(120.0, screen_w * 0.35)          # a purposeful stroll, not a twitch
+        here = self.state.x
+        low, high = margin, screen_w - CAT_SIZE - margin
+        candidates = [here - span, here + span]
+        random.shuffle(candidates)
+        tx = next((c for c in candidates if low <= c <= high), None)
+        if tx is None:
+            tx = min(max(here + random.uniform(-span, span), low), high)
+        self.state.target_x = tx
+        self.state.y = self._floor_y()
         self.state.pose = "walk"
 
     # -- drag handling --
@@ -732,7 +926,8 @@ class PawmatePrototype:
         self.state.dragging = True
         self._drag_offset = (event.x, event.y)
         self.state.pose = "idle"
-        self.state.target = None
+        self.state.target_x = None
+        self.state.speed = 0.0
 
     def _on_drag_move(self, event):
         if not self.state.dragging:
@@ -786,7 +981,8 @@ class PawmatePrototype:
 
     def _set_pose(self, pose: str):
         self.state.pose = pose
-        self.state.target = None
+        self.state.target_x = None
+        self.state.speed = 0.0
         self.state.idle_until = time.time() + 3600 if pose in ("sit", "sleep") else 0
         if pose == "walk":
             self._pick_new_target()
@@ -927,53 +1123,55 @@ class PawmatePrototype:
                 return
 
         if not st.dragging:
-            if st.pose == "walk" and st.target is not None:
-                tx, ty = st.target
-                dx, dy = tx - st.x, ty - st.y
-                dist = (dx * dx + dy * dy) ** 0.5
-                if dist < 3:
+            moved = 0.0
+            if st.pose == "walk" and st.target_x is not None:
+                dx = st.target_x - st.x
+                dist = abs(dx)
+                if dist < 1.5 and st.speed < 6.0:
                     st.pose = "idle"
+                    st.speed = 0.0
+                    st.x = st.target_x
                     st.idle_until = now + random.uniform(PAUSE_AT_TARGET_MIN_S, PAUSE_AT_TARGET_MAX_S)
                     st.idle_walk_cycles += 1
+                    st.target_x = None
                 else:
-                    step = WALK_SPEED_PX_S * dt
-                    step = min(step, dist)
-                    st.x += dx / dist * step
-                    st.y += dy / dist * step
-                    # pick the closer-matching directional sprite by dominant axis
-                    if abs(dx) >= abs(dy):
-                        st.walk_dir = "walk_e"
-                        st.facing_left = dx < 0
-                    else:
-                        st.walk_dir = "walk_s" if dy > 0 else "walk_n"
-                        st.facing_left = False
-            elif st.pose == "idle" and st.target is None and now >= st.idle_until:
+                    # Ease in and decelerate into the destination instead of
+                    # snapping between 0 and full speed — a cat doesn't start
+                    # and stop like a vehicle hitting a wall.
+                    braking = WALK_SPEED_PX_S * min(1.0, dist / WALK_EASE_PX)
+                    want = min(WALK_SPEED_PX_S, max(WALK_MIN_SPEED_PX_S, braking))
+                    st.speed += max(-WALK_ACCEL_PX_S2 * dt,
+                                    min(WALK_ACCEL_PX_S2 * dt, want - st.speed))
+                    step = min(st.speed * dt, dist)
+                    st.x += math.copysign(step, dx)
+                    st.facing_left = dx < 0
+                    moved = step
+            elif st.pose == "idle" and st.target_x is None and now >= st.idle_until:
                 if st.idle_walk_cycles >= SLEEP_AFTER_IDLE_CYCLES:
-                    st.pose = "sleep"
-                    st.idle_until = now + random.uniform(15, 30)
+                    st.pose = random.choice(("sleep", "sit", "sit"))
+                    st.idle_until = now + (random.uniform(18, 40) if st.pose == "sleep"
+                                           else random.uniform(6, 14))
                     st.idle_walk_cycles = 0
                 else:
                     self._pick_new_target()
-            elif st.pose == "sleep" and now >= st.idle_until:
+            elif st.pose in ("sleep", "sit") and now >= st.idle_until:
                 st.pose = "idle"
                 st.idle_until = now + random.uniform(IDLE_MIN_S, IDLE_MAX_S)
 
-            # Walking's leg-frames need to cycle fast relative to how fast
-            # the window glides, or the two motions visually disagree and
-            # it reads as skating on ice instead of stepping. Idle/sit get
-            # a small vertical bob for the same reason at rest: two frames
-            # swapped only once every couple of seconds, with the window
-            # otherwise perfectly still, looks like a slideshow, not a cat.
+            # Advance the walk cycle by DISTANCE TRAVELLED, not by wall time.
+            # This is the fix for "ice skating": however fast the cat happens
+            # to be moving (including while easing in and out), the paws
+            # advance exactly one stride per STRIDE_PX of ground covered, so
+            # feet and ground can never disagree.
             if st.pose == "walk":
-                st.phase = (st.phase + dt * WALK_CYCLE_HZ) % 1.0
+                st.phase = (st.phase + moved / STRIDE_PX) % 1.0
                 bob = 0.0
             else:
                 st.phase = (st.phase + dt * IDLE_CYCLE_HZ) % 1.0
                 bob = math.sin(st.phase * 2 * math.pi) * IDLE_BOB_PX if st.pose in ("idle", "sit") else 0.0
             self.root.geometry(f"+{int(st.x)}+{int(st.y - bob)}")
 
-        render_pose = st.walk_dir if st.pose == "walk" else st.pose
-        img = self.sprites.get(render_pose, st.phase, st.facing_left)
+        img = self.sprites.get(st.pose, st.phase, st.facing_left)
         self.canvas.itemconfig(self.image_id, image=img)
         self._current_image_ref = img  # keep a reference so Tk doesn't GC it
 
@@ -983,6 +1181,26 @@ class PawmatePrototype:
         self.root.mainloop()
 
 
+def main():
+    global SPRITES
+    SPRITES = SpriteSource(CAT_SIZE)
+    print(SPRITES.describe())
+
+    if "--inspect" in sys.argv:
+        # Verify what got discovered from a dropped-in sprite pack, and dump
+        # a labeled contact sheet so the pose mapping can be eyeballed
+        # before anything animates.
+        out = os.path.join(_ASSET_DIR, "contact_sheet.png")
+        SPRITES.contact_sheet(out)
+        print(f"[inspect] wrote {out}")
+        print(f"[inspect] looked for a pack in: {_CAT_DIR}")
+        if not os.path.isdir(_CAT_DIR):
+            print("[inspect] that folder doesn't exist yet — unzip a sprite pack into it "
+                  "(see README: 'Using your own cat sprites').")
+        return
+
+    PawmatePrototype().run()
+
+
 if __name__ == "__main__":
-    app = PawmatePrototype()
-    app.run()
+    main()
