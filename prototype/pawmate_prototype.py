@@ -208,12 +208,96 @@ def _slice_strip(img: Image.Image) -> list[Image.Image]:
     return [img]
 
 
+def _natural_key(path: str):
+    """Sort frame files the way a human numbers them (2 before 10)."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", stem)]
+
+
+def _extract_zips(root: str):
+    """Auto-unzip any archive dropped straight into assets/cat/."""
+    import zipfile
+    for name in os.listdir(root):
+        if not name.lower().endswith(".zip"):
+            continue
+        marker = os.path.join(root, "." + name + ".extracted")
+        if os.path.exists(marker):
+            continue
+        try:
+            with zipfile.ZipFile(os.path.join(root, name)) as z:
+                z.extractall(os.path.join(root, os.path.splitext(name)[0]))
+            open(marker, "w").close()
+            print(f"[sprite] extracted {name}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[sprite] couldn't extract {name}: {exc}")
+
+
+def _discover(root: str) -> dict[tuple[str, str], list[str]]:
+    """Catalog every candidate animation under `root`, recursively.
+
+    Asset packs unzip into arbitrary nesting (`cat/Black Cat/PNG/walk/*.png`)
+    and name frames inconsistently (`walk/0.png`, `walk_00.png`,
+    `cat_walk_01.png`), so this indexes BOTH:
+      ("dir",  <folder name>) -> images directly inside that folder
+      ("file", <stem base>)   -> images sharing a stem once the trailing
+                                 frame number is stripped
+    Callers then match these keys against animation-name aliases.
+    """
+    groups: dict[tuple[str, str], list[str]] = {}
+    file_dirs: dict[str, set[str]] = {}          # stem base -> directories it appeared in
+    dir_groups: set[str] = set()
+    for dirpath, _dirnames, filenames in os.walk(root):
+        imgs = [f for f in filenames if f.lower().endswith(_IMG_EXT)]
+        if not imgs:
+            continue
+        dirkey = _norm_name(os.path.basename(dirpath))
+        if dirkey and len(imgs) >= 2:
+            groups.setdefault(("dir", dirkey), []).extend(os.path.join(dirpath, f) for f in imgs)
+            dir_groups.add(dirpath)
+        for f in imgs:
+            stem = os.path.splitext(f)[0]
+            base = _norm_name(re.sub(r"[\s_\-.]*\d+\s*$", "", stem))
+            if base:
+                groups.setdefault(("file", base), []).append(os.path.join(dirpath, f))
+                file_dirs.setdefault(base, set()).add(dirpath)
+
+    # A stem shared across several folders (the very common `Walk/frame_00.png`,
+    # `Idle/frame_00.png` convention) is a naming coincidence, not one
+    # animation — it would otherwise splice every pose into a single blob.
+    # Drop those, but only when the folders themselves already gave us groups.
+    for base, dirs in file_dirs.items():
+        if len(dirs) > 1 and dirs <= dir_groups:
+            groups.pop(("file", base), None)
+
+    for paths in groups.values():
+        paths.sort(key=_natural_key)
+    return groups
+
+
+def _load_frames(paths: list[str]) -> list[Image.Image]:
+    """Load an animation. A lone image is treated as a strip and sliced."""
+    if len(paths) == 1:
+        try:
+            return _slice_strip(Image.open(paths[0]).convert("RGBA"))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[sprite] couldn't read {paths[0]}: {exc}")
+            return []
+    frames = []
+    for p in paths:
+        try:
+            frames.append(Image.open(p).convert("RGBA"))
+        except Exception:  # noqa: BLE001
+            pass
+    return frames
+
+
 class SpriteSource:
     """Discovers and loads cat animations from assets/cat/, else oneko."""
 
     def __init__(self, size: int):
         self.size = size
         self.anims: dict[str, list[Image.Image]] = {}
+        self.catalog: dict[tuple[str, str], list[str]] = {}
         self.origin = "none"
         self._load()
 
@@ -227,40 +311,33 @@ class SpriteSource:
         self._fill_gaps()
 
     def _load_pack(self) -> bool:
+        _extract_zips(_CAT_DIR)
+        catalog = _discover(_CAT_DIR)
+        self.catalog = catalog
         found: dict[str, list[Image.Image]] = {}
-        entries = os.listdir(_CAT_DIR)
-        by_norm = {_norm_name(e): e for e in entries}
 
         for pose, aliases in _ANIM_ALIASES.items():
-            for alias in aliases:
+            best: tuple[int, list[str]] | None = None
+            for rank, alias in enumerate(aliases):
                 key = _norm_name(alias)
-                # 1. a folder of numbered frames
-                match = next((by_norm[n] for n in by_norm
-                              if n == key and os.path.isdir(os.path.join(_CAT_DIR, by_norm[n]))), None)
-                if match:
-                    d = os.path.join(_CAT_DIR, match)
-                    files = sorted(f for f in os.listdir(d) if f.lower().endswith(_IMG_EXT))
-                    frames = []
-                    for f in files:
-                        try:
-                            frames.append(Image.open(os.path.join(d, f)).convert("RGBA"))
-                        except Exception:  # noqa: BLE001
-                            pass
-                    if frames:
-                        found[pose] = frames
-                        break
-                # 2. a strip / single image
-                strip = next((by_norm[n] for n in by_norm
-                              if n.startswith(key) and by_norm[n].lower().endswith(_IMG_EXT)), None)
-                if strip:
-                    try:
-                        img = Image.open(os.path.join(_CAT_DIR, strip)).convert("RGBA")
-                    except Exception:  # noqa: BLE001
+                for (kind, name), paths in catalog.items():
+                    if name == key:
+                        score = 1000 - rank * 10          # exact name match on a preferred alias
+                    elif key in name:
+                        score = 500 - rank * 10           # e.g. "catwalkright" contains "walk"
+                    else:
                         continue
-                    frames = _slice_strip(img)
-                    if frames:
-                        found[pose] = frames
-                        break
+                    score += min(len(paths), 20)          # prefer the richer animation
+                    if kind == "dir":
+                        score += 5                        # a folder is a stronger signal than a stem
+                    if best is None or score > best[0]:
+                        best = (score, paths)
+            if not best:
+                continue
+            frames = _load_frames(best[1])
+            if frames:
+                found[pose] = frames
+
         if not found:
             return False
         self.anims = {k: [_to_colorkey(f, self.size) for f in v] for k, v in found.items()}
@@ -1190,13 +1267,29 @@ def main():
         # Verify what got discovered from a dropped-in sprite pack, and dump
         # a labeled contact sheet so the pose mapping can be eyeballed
         # before anything animates.
+        print(f"[inspect] pack folder: {_CAT_DIR}")
+        if not os.path.isdir(_CAT_DIR):
+            print("[inspect] that folder doesn't exist yet. Create it and unzip a sprite pack "
+                  "inside (nested folders are fine; a .zip dropped in is auto-extracted).")
+        else:
+            # Show EVERY candidate group found, not just the ones that matched a
+            # known animation name — if a pack uses unusual names, this is what
+            # tells us which aliases to add.
+            cat = SPRITES.catalog
+            if cat:
+                print(f"[inspect] {len(cat)} candidate animation groups found in the pack:")
+                for (kind, name), paths in sorted(cat.items(), key=lambda kv: -len(kv[1]))[:40]:
+                    sample = os.path.relpath(paths[0], _CAT_DIR)
+                    print(f"    {kind:4}  {name:<24} {len(paths):>3} file(s)   e.g. {sample}")
+            else:
+                print("[inspect] no image files found under that folder at all.")
+        print()
+        print("[inspect] mapped to poses:")
+        for pose in ("walk", "idle", "sit", "sleep", "jump", "swipe", "groom"):
+            print(f"    {pose:<7} {SPRITES.frame_count(pose):>3} frames")
         out = os.path.join(_ASSET_DIR, "contact_sheet.png")
         SPRITES.contact_sheet(out)
-        print(f"[inspect] wrote {out}")
-        print(f"[inspect] looked for a pack in: {_CAT_DIR}")
-        if not os.path.isdir(_CAT_DIR):
-            print("[inspect] that folder doesn't exist yet — unzip a sprite pack into it "
-                  "(see README: 'Using your own cat sprites').")
+        print(f"\n[inspect] wrote {out} — open it to check nothing got mis-sliced.")
         return
 
     PawmatePrototype().run()
