@@ -8,10 +8,11 @@ with plain Python.
 
 What it demonstrates (no AI required):
   - A transparent, always-on-top, click-through overlay window (S1/S2 style spike)
-  - A procedurally drawn cat (no external art assets / licensing needed), in
-    side profile — idle / walk / sit / sleep, a real walk-cycle gait, and
-    one-shot jump/swipe action animations, all facing the direction it's
-    actually moving in
+  - A real cat sprite (the classic "Neko" desktop-pet pixel art — see
+    assets/CREDIT.md; two from-scratch hand-drawn attempts didn't read as
+    a cat at this size, so this uses actual art instead of more geometry
+    guesswork) — idle / sit / sleep / walk (4-directional) / a jump
+    celebration on app open / a paw-swipe on app close
   - Precise movement: wanders the screen, or (best-effort) walks between your real
     desktop icon positions, pausing at each one ("walking over your folders")
   - Drag-to-move
@@ -46,7 +47,6 @@ import ctypes
 import ctypes.wintypes as wt
 import difflib
 import json
-import math
 import os
 import random
 import re
@@ -78,7 +78,7 @@ from PIL import Image, ImageDraw, ImageTk
 # Config
 # ---------------------------------------------------------------------------
 
-CAT_SIZE = 140                 # window / sprite size in px
+CAT_SIZE = 128                 # window / sprite size in px — 4x the sprite sheet's native 32px, for crisp NEAREST upscaling
 TRANSPARENT_KEY = "#ff00ff"    # color-keyed as transparent by the OS
 FPS = 30
 TICK_MS = int(1000 / FPS)
@@ -94,259 +94,76 @@ CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "").strip()
 CF_MODEL = os.environ.get("CF_MODEL", "@cf/meta/llama-3.1-8b-instruct")
 
 # ---------------------------------------------------------------------------
-# Cat sprite drawing (procedural, no external assets)
+# Cat sprite — real pixel art, not hand-drawn primitives.
 #
-# Side-profile, facing +x (right) by default — mirrored for facing left.
-# A front-on chibi face was tried first and looked cute standing still, but
-# a desktop pet spends most of its life walking, and a face that always
-# stares at the viewer regardless of travel direction doesn't read as
-# "walking somewhere." Side profile makes the direction of travel legible
-# at a glance, the way every classic desktop-pet sprite (Neko, Shimeji, …)
-# does it.
+# Two from-scratch attempts at drawing a cat out of ellipses/polygons both
+# came out looking wrong (a front-facing "chibi blob," then a side-profile
+# that still didn't read as a cat at this size) — geometry-by-guesswork
+# doesn't converge on "obviously a cat" the way an artist's actual drawing
+# does. So: this uses the classic "Neko" desktop-pet sprite instead (see
+# assets/CREDIT.md for provenance/license) — small (32x32), hand-drawn,
+# instantly recognizable, and it's specifically *designed* for this exact
+# job (a screen-roaming desktop cat) since 1989.
 #
-# Everything is drawn at SUPERSAMPLE x the final size and downscaled with
-# LANCZOS for anti-aliased edges, since PIL's ImageDraw has no native AA.
-#
-# Every fill is fully opaque (alpha 255) except the transparent color key —
-# Tk's -transparentcolor does exact color-key matching, not alpha blending,
-# so any translucent pixel here would render wrong (a muddy blend against
-# whatever this script's own canvas happened to show) instead of the
-# blended-with-fur look you'd expect from a normal alpha compositor.
+# The sheet is 8 columns x 4 rows of 32x32 frames. Poses below were picked
+# by rendering the whole grid, labeling every cell, and looking at it —
+# not by trusting a half-remembered mapping.
 # ---------------------------------------------------------------------------
 
-SUPERSAMPLE = 5
-
-FUR = (240, 165, 80, 255)
-FUR_DARK = (208, 126, 52, 255)
-CREAM = (255, 246, 227, 255)
-BLACK = (35, 30, 28, 255)
-PINK = (255, 176, 188, 255)
-PINK_SOFT = (255, 214, 222, 255)
-WHITE = (255, 255, 255, 255)
-NOSE = (232, 140, 150, 255)
-WHISKER = (120, 95, 80, 255)
-SHADOW = (180, 60, 130, 90)
 MAGENTA_OPAQUE = (255, 0, 255, 255)
+_SPRITE_SHEET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "oneko.gif")
+_FRAME_PX = 32
 
-GROUND_Y = 124  # paws rest on this line, in the 140x140 logical canvas
+# pose -> sequence of (column, row) cells in the sheet, alternated over phase 0..1
+_POSE_FRAMES: dict[str, list[tuple[int, int]]] = {
+    "idle": [(2, 2), (1, 1)],
+    "sit": [(4, 3), (1, 3)],
+    "sleep": [(2, 0), (2, 1)],
+    "walk_e": [(4, 2), (5, 2)],
+    "walk_n": [(5, 0), (6, 0)],
+    "walk_s": [(6, 2), (7, 2)],
+    "jump": [(7, 3), (3, 2)],    # celebration flash, played on a successful app open
+    "swipe": [(0, 0), (1, 0)],   # paw-swipe gesture, played on app close
+}
 
+try:
+    _sheet = Image.open(_SPRITE_SHEET_PATH).convert("RGBA")
+except FileNotFoundError:
+    _sheet = None
+    print(f"[sprite] missing {_SPRITE_SHEET_PATH!r} — the cat will not render. "
+          f"Re-clone/re-pull the repo so prototype/assets/oneko.gif comes along.")
 
-def _s(v: float) -> float:
-    return v * SUPERSAMPLE
-
-
-def _new_frame() -> Image.Image:
-    big = CAT_SIZE * SUPERSAMPLE
-    return Image.new("RGBA", (big, big), MAGENTA_OPAQUE)
-
-
-def _downsample(img: Image.Image) -> Image.Image:
-    return img.resize((CAT_SIZE, CAT_SIZE), Image.LANCZOS)
-
-
-def _ellipse(d: ImageDraw.ImageDraw, cx, cy, rx, ry, **kw):
-    d.ellipse([_s(cx - rx), _s(cy - ry), _s(cx + rx), _s(cy + ry)], **kw)
-
-
-def _line(d: ImageDraw.ImageDraw, pts, fill, width):
-    d.line([(_s(x), _s(y)) for x, y in pts], fill=fill, width=int(_s(width)), joint="curve")
-
-
-def _tri(d: ImageDraw.ImageDraw, pts, fill):
-    d.polygon([(_s(x), _s(y)) for x, y in pts], fill=fill)
+_frame_cache: dict[tuple[int, int], Image.Image] = {}
 
 
-def _leg(d: ImageDraw.ImageDraw, top, bottom_x, bottom_y, width, paw_r):
-    _line(d, [top, (bottom_x, bottom_y)], FUR_DARK, width)
-    _ellipse(d, bottom_x, bottom_y, paw_r, paw_r * 0.72, fill=CREAM, outline=FUR_DARK, width=max(1, int(_s(1.2))))
-
-
-def _head_side(d: ImageDraw.ImageDraw, hx, hy, r, eyes_closed=False, blush=False):
-    """Head in side profile, snout pointing toward +x (the walk direction)."""
-    _tri(d, [(hx - r * 0.35, hy - r * 0.75), (hx - r * 0.55, hy - r * 1.55), (hx + r * 0.05, hy - r * 0.85)],
-         FUR_DARK)  # far ear
-    _ellipse(d, hx, hy, r, r * 0.92, fill=FUR)  # head
-    _tri(d, [(hx + r * 0.15, hy - r * 0.78), (hx + r * 0.05, hy - r * 1.6), (hx + r * 0.62, hy - r * 0.85)],
-         FUR_DARK)  # near ear
-    _tri(d, [(hx + r * 0.24, hy - r * 0.78), (hx + r * 0.2, hy - r * 1.35), (hx + r * 0.5, hy - r * 0.86)], PINK)
-    _ellipse(d, hx + r * 0.86, hy + r * 0.18, r * 0.42, r * 0.34, fill=CREAM)  # snout
-    for off in (-0.15, 0.15, 0.42):  # forehead tabby stripes
-        _line(d, [(hx + off * r, hy - r * 0.7), (hx + off * r + r * 0.12, hy - r * 0.25)], FUR_DARK, r * 0.09)
-    if blush:
-        _ellipse(d, hx - r * 0.15, hy + r * 0.25, r * 0.16, r * 0.11, fill=PINK_SOFT)
-    ex, ey = hx + r * 0.28, hy - r * 0.05
-    eye_r = r * 0.26
-    if eyes_closed:
-        d.arc([_s(ex - eye_r * 0.85), _s(ey - eye_r * 0.3), _s(ex + eye_r * 0.85), _s(ey + eye_r * 0.55)],
-              start=15, end=165, fill=BLACK, width=max(1, int(_s(r * 0.08))))
-    else:
-        _ellipse(d, ex, ey, eye_r * 0.66, eye_r, fill=BLACK)
-        _ellipse(d, ex - eye_r * 0.15, ey - eye_r * 0.35, eye_r * 0.24, eye_r * 0.28, fill=WHITE)
-    nx, ny = hx + r * 1.18, hy + r * 0.14  # nose + mouth at the snout tip
-    nr = r * 0.13
-    _tri(d, [(nx - nr, ny - nr * 0.6), (nx + nr * 0.3, ny - nr * 0.6), (nx - nr * 0.35, ny + nr * 0.7)], NOSE)
-    d.arc([_s(nx - r * 0.32), _s(ny), _s(nx + r * 0.02), _s(ny + r * 0.3)], start=250, end=360, fill=BLACK,
-          width=max(1, int(_s(r * 0.045))))
-    for wy_off in (-0.05, 0.12):
-        wy = hy + r * (0.15 + wy_off)
-        _line(d, [(hx + r * 0.95, wy), (hx + r * 1.6, wy - r * 0.1)], WHISKER, r * 0.03)
-
-
-def _draw_walk(phase: float) -> Image.Image:
-    img = _new_frame()
-    d = ImageDraw.Draw(img)
-    stride = math.sin(phase * 2 * math.pi)
-    bob = abs(math.cos(phase * 2 * math.pi)) * 3.0
-    body_cx, body_cy = 62, 98 - bob
-
-    tail_swing = stride * 10  # trails behind (-x), swinging opposite the stride
-    _line(d, [(body_cx - 28, body_cy - 2), (body_cx - 50, body_cy - 22 + tail_swing * 0.4),
-              (body_cx - 58, body_cy - 44 + tail_swing)], FUR_DARK, 8)
-    _leg(d, (body_cx - 16, body_cy + 8), body_cx - 16 + stride * 9, GROUND_Y, 6, 6)  # back legs
-    _leg(d, (body_cx - 6, body_cy + 10), body_cx - 6 - stride * 5, GROUND_Y, 5.5, 5.5)
-    _ellipse(d, body_cx, body_cy, 34, 19, fill=FUR)  # body
-    _ellipse(d, body_cx + 2, body_cy + 5, 22, 11, fill=CREAM)
-    _leg(d, (body_cx + 22, body_cy + 9), body_cx + 22 - stride * 9, GROUND_Y, 6, 6)  # front legs
-    _leg(d, (body_cx + 30, body_cy + 8), body_cx + 30 + stride * 5, GROUND_Y, 5.5, 5.5)
-    _head_side(d, body_cx + 40, body_cy - 20 - bob * 0.3, 21)
-    return _downsample(img)
-
-
-def _draw_idle(phase: float, blink: bool) -> Image.Image:
-    img = _new_frame()
-    d = ImageDraw.Draw(img)
-    breathe = math.sin(phase * 2 * math.pi) * 1.3
-    body_cx, body_cy = 62, 100
-
-    tail_swish = math.sin(phase * 2 * math.pi * 0.5) * 6
-    _line(d, [(body_cx - 28, body_cy - 2), (body_cx - 50, body_cy - 20 + tail_swish),
-              (body_cx - 56, body_cy - 42 + tail_swish)], FUR_DARK, 8)
-    _leg(d, (body_cx - 16, body_cy + 8), body_cx - 16, GROUND_Y, 6, 6)
-    _leg(d, (body_cx + 24, body_cy + 9), body_cx + 24, GROUND_Y, 6, 6)
-    _ellipse(d, body_cx, body_cy - breathe * 0.15, 34 + breathe * 0.5, 19 + breathe * 0.3, fill=FUR)
-    _ellipse(d, body_cx + 2, body_cy + 5, 22, 11, fill=CREAM)
-    _head_side(d, body_cx + 40, body_cy - 20 - breathe * 0.2, 21, eyes_closed=blink)
-    return _downsample(img)
-
-
-def _draw_sit(phase: float) -> Image.Image:
-    img = _new_frame()
-    d = ImageDraw.Draw(img)
-    breathe = math.sin(phase * 2 * math.pi) * 1.0
-    body_cx, body_cy = 58, 96
-
-    _line(d, [(body_cx - 26, body_cy + 6), (body_cx - 40, body_cy + 22), (body_cx - 20, body_cy + 32),
-              (body_cx + 6, body_cy + 24)], FUR_DARK, 7)  # tail curls around the front paws
-    _ellipse(d, body_cx - 6, body_cy + 12, 28, 22, fill=FUR)  # haunch, resting on the ground
-    _line(d, [(body_cx + 20, body_cy - 2), (body_cx + 22, GROUND_Y)], FUR_DARK, 7)  # upright front legs
-    _ellipse(d, body_cx + 22, GROUND_Y, 6.5, 5.5, fill=CREAM, outline=FUR_DARK, width=2)
-    _line(d, [(body_cx + 32, body_cy + 2), (body_cx + 34, GROUND_Y)], FUR_DARK, 6.5)
-    _ellipse(d, body_cx + 34, GROUND_Y, 6, 5, fill=CREAM, outline=FUR_DARK, width=2)
-    _ellipse(d, body_cx + 14, body_cy - 22, 20, 26, fill=FUR)  # torso rising to the head
-    _ellipse(d, body_cx + 16, body_cy - 14, 12, 15, fill=CREAM)
-    _head_side(d, body_cx + 30, body_cy - 46 - breathe * 0.2, 21)
-    return _downsample(img)
-
-
-def _draw_sleep(phase: float) -> Image.Image:
-    img = _new_frame()
-    d = ImageDraw.Draw(img)
-    breathe = math.sin(phase * 2 * math.pi) * 1.0
-    cx, cy = 74, 104
-
-    _ellipse(d, cx, cy + breathe * 0.2, 44, 22 + breathe * 0.5, fill=FUR)  # curled loaf body
-    _ellipse(d, cx - 2, cy + 6, 28, 12, fill=CREAM)
-    d.arc([_s(cx - 34), _s(cy - 24), _s(cx + 38), _s(cy + 20)], start=195, end=345, fill=FUR_DARK, width=int(_s(7)))
-    _ellipse(d, cx - 20, cy + 16, 6.5, 5, fill=CREAM, outline=FUR_DARK, width=2)  # front paws tucked under chin
-    _ellipse(d, cx - 4, cy + 18, 6.5, 5, fill=CREAM, outline=FUR_DARK, width=2)
-
-    hx, hy, rh = cx - 32, cy - 14, 24
-    _tri(d, [(hx - rh * 0.5, hy - rh * 0.55), (hx - rh * 0.9, hy - rh * 1.35), (hx - rh * 0.1, hy - rh * 0.65)],
-         FUR_DARK)
-    _ellipse(d, hx, hy, rh, rh * 0.88, fill=FUR)
-    _ellipse(d, hx, hy + rh * 0.32, rh * 0.55, rh * 0.36, fill=CREAM)
-    d.arc([_s(hx - rh * 0.5), _s(hy - 6), _s(hx + rh * 0.02), _s(hy + 8)], start=10, end=170,
-          fill=BLACK, width=max(1, int(_s(rh * 0.12))))
-    nr = rh * 0.1
-    _tri(d, [(hx - rh * 0.02 - nr, hy + 5), (hx - rh * 0.02 + nr, hy + 5), (hx - rh * 0.02, hy + 5 + nr * 1.3)],
-         NOSE)
-
-    zx, zy = cx + 34, cy - 34  # drifting "Zzz"
-    for i, sz_mult in enumerate((1.0, 0.78, 0.58)):
-        zxi, zyi = zx + i * 8, zy - i * 11
-        sz = 7 * sz_mult
-        d.line([(_s(zxi), _s(zyi)), (_s(zxi + sz), _s(zyi)), (_s(zxi), _s(zyi + sz)), (_s(zxi + sz), _s(zyi + sz))],
-               fill=WHISKER, width=max(1, int(_s(1.4 * sz_mult))), joint="curve")
-    return _downsample(img)
-
-
-def _draw_jump(phase: float) -> Image.Image:
-    """One-shot celebration hop, played when an app successfully opens."""
-    img = _new_frame()
-    d = ImageDraw.Draw(img)
-    rise = math.sin(phase * math.pi) * 34
-    squash = 1.0 - 0.25 * math.sin(phase * math.pi)
-    body_cx, body_cy = 65, 100 - rise
-
-    shadow_scale = 1.0 - 0.55 * math.sin(phase * math.pi)  # shrinks as the cat rises, sells the height
-    _ellipse(d, body_cx, GROUND_Y + 2, 26 * shadow_scale, 6 * shadow_scale, fill=SHADOW)
-
-    tail_swing = math.sin(phase * math.pi) * 14
-    _line(d, [(body_cx - 28, body_cy), (body_cx - 46, body_cy - 18 - tail_swing * 0.3),
-              (body_cx - 50, body_cy - 40 - tail_swing)], FUR_DARK, 8)
-    tuck = math.sin(phase * math.pi)  # legs tuck up mid-air
-    _leg(d, (body_cx - 16, body_cy + 6), body_cx - 18, GROUND_Y - tuck * 14, 6, 6)
-    _ellipse(d, body_cx, body_cy, 34 * squash, 19 / squash * 0.85, fill=FUR)
-    _ellipse(d, body_cx + 2, body_cy + 4, 22 * squash, 11, fill=CREAM)
-    _leg(d, (body_cx + 22, body_cy + 7), body_cx + 24, GROUND_Y - tuck * 14, 6, 6)
-    _head_side(d, body_cx + 40, body_cy - 20, 21)
-    return _downsample(img)
-
-
-def _draw_swipe(phase: float) -> Image.Image:
-    """One-shot paw-swipe gesture, played when an app closes."""
-    img = _new_frame()
-    d = ImageDraw.Draw(img)
-    swipe = math.sin(phase * math.pi)  # 0 -> 1 -> 0 across the gesture
-    body_cx, body_cy = 62, 98
-
-    _line(d, [(body_cx - 28, body_cy - 2), (body_cx - 48, body_cy - 18), (body_cx - 54, body_cy - 38)],
-          FUR_DARK, 8)
-    _leg(d, (body_cx - 16, body_cy + 8), body_cx - 16, GROUND_Y, 6, 6)
-    _ellipse(d, body_cx, body_cy, 34, 19, fill=FUR)
-    _ellipse(d, body_cx + 2, body_cy + 5, 22, 11, fill=CREAM)
-    paw_x = body_cx + 26 + swipe * 14  # extended front paw, swiping down-forward
-    paw_y = body_cy + 4 + swipe * 16
-    _line(d, [(body_cx + 22, body_cy + 4), (paw_x, paw_y)], FUR_DARK, 6.5)
-    _ellipse(d, paw_x, paw_y, 6.5, 5.5, fill=CREAM, outline=FUR_DARK, width=2)
-    _leg(d, (body_cx + 30, body_cy + 8), body_cx + 30, GROUND_Y, 5.5, 5.5)
-    _head_side(d, body_cx + 40, body_cy - 20, 21, blush=True)
-    return _downsample(img)
-
-
-_ONE_SHOT_POSES = {"jump": _draw_jump, "swipe": _draw_swipe}
+def _sprite_frame(col: int, row: int) -> Image.Image:
+    key = (col, row)
+    if key in _frame_cache:
+        return _frame_cache[key]
+    box = (col * _FRAME_PX, row * _FRAME_PX, (col + 1) * _FRAME_PX, (row + 1) * _FRAME_PX)
+    raw = _sheet.crop(box) if _sheet else Image.new("RGBA", (_FRAME_PX, _FRAME_PX), (0, 0, 0, 0))
+    # composite onto opaque magenta (colorkey transparency, not alpha — see
+    # the module docstring) with NEAREST upscaling to keep pixel art crisp
+    # instead of LANCZOS-blurring a 32px sprite into mush.
+    canvas = Image.new("RGBA", raw.size, MAGENTA_OPAQUE)
+    canvas.paste(raw, (0, 0), raw)
+    canvas = canvas.resize((CAT_SIZE, CAT_SIZE), Image.NEAREST)
+    _frame_cache[key] = canvas
+    return canvas
 
 
 def draw_cat(pose: str, phase: float, face_left: bool) -> Image.Image:
     """Draw one animation frame of the cat.
 
-    pose: 'idle' | 'walk' | 'sit' | 'sleep' | 'jump' | 'swipe'
-    phase: 0..1 animation phase (walk cycle / breathing / blink timing, or
-           position along a one-shot action for 'jump'/'swipe')
-    face_left: mirror horizontally (walking left, or just a facing choice
-               for the stationary poses)
+    pose: 'idle' | 'sit' | 'sleep' | 'walk_e' | 'walk_n' | 'walk_s' | 'jump' | 'swipe'
+    phase: 0..1, selects among that pose's frames (2 frames for a walk
+           cycle, or a jump/swipe's position through its one-shot gesture)
+    face_left: mirror horizontally — used for walk_e (becomes "walk west")
+               and as a general facing choice for the stationary poses
     """
-    if pose in _ONE_SHOT_POSES:
-        img = _ONE_SHOT_POSES[pose](phase)
-    elif pose == "walk":
-        img = _draw_walk(phase)
-    elif pose == "sit":
-        img = _draw_sit(phase)
-    elif pose == "sleep":
-        img = _draw_sleep(phase)
-    else:
-        # idle: brief blink once near the top of each phase loop
-        img = _draw_idle(phase, blink=phase < 0.06)
+    frames = _POSE_FRAMES.get(pose, _POSE_FRAMES["idle"])
+    idx = int(phase * len(frames)) % len(frames)
+    img = _sprite_frame(*frames[idx])
     return img.transpose(Image.FLIP_LEFT_RIGHT) if face_left else img
 
 
@@ -767,6 +584,7 @@ class PetState:
     y: float
     pose: str = "idle"
     facing_left: bool = False
+    walk_dir: str = "walk_e"  # which directional sprite to use while pose == "walk"
     phase: float = 0.0
     target: tuple[float, float] | None = None
     pause_until: float = 0.0
@@ -1104,7 +922,13 @@ class PawmatePrototype:
                     step = min(step, dist)
                     st.x += dx / dist * step
                     st.y += dy / dist * step
-                    st.facing_left = dx < 0
+                    # pick the closer-matching directional sprite by dominant axis
+                    if abs(dx) >= abs(dy):
+                        st.walk_dir = "walk_e"
+                        st.facing_left = dx < 0
+                    else:
+                        st.walk_dir = "walk_s" if dy > 0 else "walk_n"
+                        st.facing_left = False
                     self.root.geometry(f"+{int(st.x)}+{int(st.y)}")
             elif st.pose == "idle" and st.target is None and now >= st.idle_until:
                 if st.idle_walk_cycles >= SLEEP_AFTER_IDLE_CYCLES:
@@ -1118,7 +942,8 @@ class PawmatePrototype:
                 st.idle_until = now + random.uniform(IDLE_MIN_S, IDLE_MAX_S)
 
         st.phase = (st.phase + dt * (0.9 if st.pose == "walk" else 0.25)) % 1.0
-        img = self.sprites.get(st.pose, st.phase, st.facing_left)
+        render_pose = st.walk_dir if st.pose == "walk" else st.pose
+        img = self.sprites.get(render_pose, st.phase, st.facing_left)
         self.canvas.itemconfig(self.image_id, image=img)
         self._current_image_ref = img  # keep a reference so Tk doesn't GC it
 

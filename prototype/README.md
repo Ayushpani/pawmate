@@ -17,11 +17,12 @@ stack. Plain Python, one file, no build step.
 
 - Transparent, always-on-top, **click-through** overlay window (empty space
   passes clicks through to whatever's beneath; the cat itself is clickable)
-- A procedurally drawn cat, in **side profile** — idle / walk / sit / sleep,
-  a real walk-cycle gait, and one-shot **jump** (on a successful app open)
-  and **paw-swipe** (on app close) action animations. It always faces the
-  direction it's actually walking, instead of staring at the screen while
-  sliding sideways.
+- A **real cat sprite** — the classic "Neko" desktop-pet pixel art (see
+  `assets/CREDIT.md` for provenance/license). Two from-scratch hand-drawn
+  attempts at a procedural cat didn't actually read as a cat at this size;
+  this uses real art instead of more geometry guesswork. Idle / sit /
+  sleep / 4-directional walk, plus a **jump** celebration on a successful
+  app open and a **paw-swipe** gesture on app close.
 - Wanders the screen, and — best-effort — walks between your **real desktop
   icon positions**, pausing at each one, so it visibly "visits your folders"
 - **Drag** to pick it up and move it
@@ -128,12 +129,19 @@ setup itself rather than the later Win32 styling pass.
 - Run it as a **normal user**, not elevated/Administrator — an elevated
   process can have trouble reading a non-elevated Explorer's memory, and
   generally you don't want a pet running with admin rights anyway.
-- The cat is flat-shaded 2D (PIL-drawn), not the live 3D Quaternius model
-  from the master plan — that's Phase 4 territory once the Tauri/Three.js
-  shell exists. This prototype exists purely to prove the *mechanics*
-  (transparency, click-through, precise movement, app open/close with
-  confirmation, optional free-LLM chat) on real Windows before that
-  investment.
+- The cat is small 32px pixel art (upscaled 4x, nearest-neighbor so it
+  stays crisp instead of blurry), not the live 3D Quaternius model from
+  the master plan — that's Phase 4 territory once the Tauri/Three.js shell
+  exists, and this placeholder sprite (see `assets/CREDIT.md`) isn't meant
+  to survive to a real release either way. This prototype exists purely to
+  prove the *mechanics* (transparency, click-through, precise movement,
+  app open/close with confirmation, optional free-LLM chat) on real
+  Windows before that investment.
+- Walk direction only picks from 4 cardinal sprites (E/W mirrored, N, S)
+  by whichever of dx/dy is larger, not true 8-way — diagonal movement
+  snaps to the nearer cardinal direction rather than showing a dedicated
+  diagonal frame. Good enough to make "which way is it going" legible;
+  a real product would use the sheet's diagonal frames too.
 - **App resolution** needs `powershell` on PATH (it ships with every
   Windows 10/11 install, so this should always be true) and takes ~0.5–1s
   to build the first time, in a background thread — if you `open` something
