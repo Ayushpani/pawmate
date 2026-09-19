@@ -276,21 +276,55 @@ def _discover(root: str) -> dict[tuple[str, str], list[str]]:
     return groups
 
 
-def _load_frames(paths: list[str]) -> list[Image.Image]:
-    """Load an animation. A lone image is treated as a strip and sliced."""
-    if len(paths) == 1:
+def _open_frames(path: str) -> list[Image.Image]:
+    """Every frame of an image file.
+
+    Crucially this handles ANIMATED files (GIF/WebP): PIL hands you only
+    frame 0 unless you seek through the sequence, so a perfectly good
+    8-frame walk GIF otherwise silently collapses into one static picture.
+    """
+    im = Image.open(path)
+    n = getattr(im, "n_frames", 1)
+    if n <= 1:
+        return [im.convert("RGBA")]
+    out = []
+    for i in range(n):
         try:
-            return _slice_strip(Image.open(paths[0]).convert("RGBA"))
-        except Exception as exc:  # noqa: BLE001
-            print(f"[sprite] couldn't read {paths[0]}: {exc}")
-            return []
-    frames = []
+            im.seek(i)
+        except EOFError:
+            break
+        out.append(im.convert("RGBA"))
+    return out
+
+
+def _load_frames(paths: list[str]) -> list[Image.Image]:
+    """Turn a discovered group of files into an ordered animation."""
+    loaded: list[tuple[str, list[Image.Image]]] = []
     for p in paths:
         try:
-            frames.append(Image.open(p).convert("RGBA"))
-        except Exception:  # noqa: BLE001
-            pass
-    return frames
+            frames = _open_frames(p)
+            if frames:
+                loaded.append((p, frames))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[sprite] couldn't read {p}: {exc}")
+    if not loaded:
+        return []
+
+    # If the files are themselves animations, each one is a COMPLETE clip —
+    # they're variants (commonly the same clip exported at 2x and 4x, whose
+    # names collapse to the same stem), not frames of a shared animation.
+    # Pick the richest/highest-resolution one rather than splicing them.
+    animated = [(p, f) for p, f in loaded if len(f) > 1]
+    if animated:
+        path, frames = max(animated, key=lambda pf: (len(pf[1]), pf[1][0].size[0] * pf[1][0].size[1]))
+        if len(animated) > 1:
+            print(f"[sprite] {len(animated)} animated variants; using {os.path.basename(path)} "
+                  f"({len(frames)} frames, {frames[0].size[0]}x{frames[0].size[1]})")
+        return frames
+
+    if len(loaded) == 1:
+        return _slice_strip(loaded[0][1][0])          # a lone still image = a strip
+    return [f[0] for _, f in loaded]                  # one still image per frame
 
 
 class SpriteSource:
@@ -1288,6 +1322,28 @@ def main():
                     print(f"    {kind:4}  {name:<24} {len(paths):>3} file(s)   e.g. {sample}")
             else:
                 print("[inspect] no image files found under that folder at all.")
+
+            # Per-file detail: dimensions and internal frame count. This is what
+            # distinguishes a static sprite sheet from an animated GIF, and shows
+            # which scale variant is which.
+            seen: set[str] = set()
+            files: list[str] = []
+            for paths in cat.values():
+                for p in paths:
+                    if p not in seen:
+                        seen.add(p)
+                        files.append(p)
+            if files:
+                print(f"\n[inspect] {len(files)} image file(s) in detail:")
+                for p in sorted(files):
+                    try:
+                        im = Image.open(p)
+                        n = getattr(im, "n_frames", 1)
+                        kind = f"{n} frames (animated)" if n > 1 else "still"
+                        print(f"    {os.path.relpath(p, _CAT_DIR):<52} "
+                              f"{im.size[0]:>5}x{im.size[1]:<5} {kind}")
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"    {os.path.relpath(p, _CAT_DIR):<52} unreadable ({exc})")
         print()
         print("[inspect] mapped to poses:")
         for pose in ("walk", "idle", "sit", "sleep", "jump", "swipe", "groom"):
