@@ -13,11 +13,31 @@ stack. Plain Python, one file, no build step.
 > (with a console message) rather than crashing when unavailable. Run it on
 > your laptop and tell me what breaks — that's the fastest way to harden it.
 
-## Using your own cat sprites (recommended)
+## The character
 
-The bundled fallback sprite only has **2 frames per animation**, which can
-never look smooth — that's a hard ceiling, not a tuning problem. Drop in a
-real sprite pack and it'll use every frame the artist drew.
+The default is a **procedural blob** — no download needed, and it runs by
+default:
+
+```powershell
+python pawmate_prototype.py
+```
+
+Why a blob: every failed attempt at this pet was an *anatomy* failure —
+legs, proportions, gait. A blob has no anatomy to get wrong. It's animated
+purely with volume-preserving squash & stretch, which is continuous maths
+rather than a fixed set of drawn frames, so it can be sampled at any
+smoothness and never looks like the wrong animal.
+
+### Or use a downloaded sprite pack instead
+
+```powershell
+python pawmate_prototype.py --sprites          # use assets/cat/ instead of the blob
+python pawmate_prototype.py --sprites --flip   # if the art faces LEFT and walks backwards
+```
+
+Packs whose art faces left will walk backwards without `--flip`, because
+rendering assumes the character faces right and mirrors it for leftward
+travel.
 
 The sandbox this was built in has `itch.io` and `opengameart.org` blocked by
 its network proxy, so the pack has to be downloaded on your machine. Good

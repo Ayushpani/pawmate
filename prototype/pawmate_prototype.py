@@ -149,30 +149,63 @@ def _norm_name(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", s.lower())
 
 
-def _to_colorkey(img: Image.Image, size: int) -> Image.Image:
-    """Composite onto opaque magenta and scale to `size`.
+def _key_out_background(img: Image.Image) -> Image.Image:
+    """Make a sprite's background transparent when it has no real alpha.
 
-    Tk's -transparentcolor is an exact color-key match, not alpha blending,
-    so every pixel must end up fully opaque: cat pixels keep their color,
-    everything else becomes the key color. Small source art is scaled with
-    NEAREST to stay crisp; large (hi-res) art with LANCZOS to stay smooth.
+    Plenty of packs ship frames with NO alpha channel at all — the
+    background is just a flat colour (often a lurid key colour, or white).
+    Pasting those straight onto the colour key covers it completely, which
+    is what puts a solid rectangle around the character on screen. So: if
+    the image is fully opaque, take the majority corner colour as the
+    background and knock it out.
     """
-    img = img.convert("RGBA")
-    # trim fully transparent margins so frames of differing padding align
-    bbox = img.getbbox()
-    canvas = Image.new("RGBA", img.size, MAGENTA_OPAQUE)
-    canvas.paste(img, (0, 0), img)
-    resample = Image.NEAREST if max(img.size) < 96 else Image.LANCZOS
+    alpha = img.getchannel("A")
+    if alpha.getextrema()[0] < 255:
+        return img                                    # already has real transparency
+
+    w, h = img.size
+    corners = [img.getpixel(p)[:3] for p in ((0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1))]
+    bg = max(set(corners), key=corners.count)
+    if corners.count(bg) < 3:
+        return img                                    # no consistent background; leave it alone
+
+    px = img.load()
+    tol = 12
+    for y in range(h):
+        for x in range(w):
+            r, g, b, _ = px[x, y]
+            if abs(r - bg[0]) <= tol and abs(g - bg[1]) <= tol and abs(b - bg[2]) <= tol:
+                px[x, y] = (r, g, b, 0)
+    return img
+
+
+def _to_colorkey(img: Image.Image, size: int) -> Image.Image:
+    """Scale to `size` and composite onto the opaque colour key.
+
+    Tk's -transparentcolor is an exact match, not alpha blending, so an
+    anti-aliased edge pixel (half character, half key colour) matches
+    neither and shows up as a coloured halo. Scaling happens on the ALPHA
+    image first and the alpha is then hardened to 0/255, so edges stay
+    clean instead of fringing.
+    """
+    img = _key_out_background(img.convert("RGBA"))
+
     if img.size != (size, size):
-        # letterbox into a square so non-square frames don't get distorted
         w, h = img.size
         scale = min(size / w, size / h)
         new = (max(1, int(w * scale)), max(1, int(h * scale)))
-        scaled = canvas.resize(new, resample)
-        out = Image.new("RGBA", (size, size), MAGENTA_OPAQUE)
-        out.paste(scaled, ((size - new[0]) // 2, size - new[1]))  # feet on the bottom edge
-        return out
-    return canvas
+        resample = Image.NEAREST if max(img.size) < 96 else Image.LANCZOS
+        img = img.resize(new, resample)
+
+    r, g, b, a = img.split()
+    a = a.point(lambda v: 255 if v >= 128 else 0)     # harden: no partial-alpha fringe
+    img = Image.merge("RGBA", (r, g, b, a))
+
+    out = Image.new("RGBA", (size, size), MAGENTA_OPAQUE)
+    ox = (size - img.size[0]) // 2
+    oy = size - img.size[1]                           # feet on the bottom edge
+    out.paste(img, (ox, oy), img)
+    return out
 
 
 def _slice_strip(img: Image.Image) -> list[Image.Image]:
@@ -327,8 +360,146 @@ def _load_frames(paths: list[str]) -> list[Image.Image]:
     return [f[0] for _, f in loaded]                  # one still image per frame
 
 
+# ---------------------------------------------------------------------------
+# Built-in character: a procedural blob.
+#
+# Every failed attempt at drawing this pet was an ANATOMY failure — legs,
+# proportions, gait. A blob has no anatomy to get wrong: it's animated purely
+# with squash & stretch (volume-preserving, so it never looks like it's just
+# being scaled), which is continuous maths rather than a fixed set of drawn
+# frames. That means it can be sampled at any smoothness, and there is no
+# "that doesn't look like the animal" failure mode.
+# ---------------------------------------------------------------------------
+
+BLOB_BODY = (94, 204, 176, 255)
+BLOB_DARK = (58, 166, 141, 255)
+BLOB_HILITE = (168, 234, 216, 255)
+BLOB_EYE = (28, 42, 48, 255)
+BLOB_WHITE = (255, 255, 255, 255)
+BLOB_SHADOW = (150, 120, 160, 255)
+_BLOB_SS = 4
+_BLOB_GROUND = 108.0
+_BLOB_LOGICAL = 128
+
+
+def _blob_frame(rise: float, squash: float, look: float = 1.0, blink: bool = False,
+                size: int = 128) -> Image.Image:
+    """One blob frame. `squash` > 1 is wide/flat, < 1 is tall/thin.
+
+    Height scales inversely with width so the blob conserves volume — that's
+    what makes squash & stretch read as a soft body rather than a resize.
+    """
+    from PIL import ImageDraw as _ID
+    ss = _BLOB_SS
+    big = _BLOB_LOGICAL * ss
+    img = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+    d = _ID.Draw(img)
+
+    def S(v):
+        return v * ss
+
+    def E(cx, cy, rx, ry, **kw):
+        d.ellipse([S(cx - rx), S(cy - ry), S(cx + rx), S(cy + ry)], **kw)
+
+    r0 = 30.0
+    rx, ry = r0 * squash, r0 / squash
+    cx, cy = 64.0, _BLOB_GROUND - ry - rise
+
+    t = max(0.0, min(1.0, rise / 40.0))                       # shadow shrinks with height
+    E(cx, _BLOB_GROUND + 3, (26 - 10 * t) * squash, 6 - 2.5 * t, fill=BLOB_SHADOW)
+
+    E(cx, cy, rx, ry, fill=BLOB_BODY)
+    E(cx, cy + ry * 0.34, rx * 0.82, ry * 0.5, fill=BLOB_DARK)
+    E(cx, cy, rx, ry * 0.99, fill=BLOB_BODY)
+    E(cx - rx * 0.34, cy - ry * 0.40, rx * 0.26, ry * 0.19, fill=BLOB_HILITE)
+
+    ex, ey = cx + look * rx * 0.22, cy - ry * 0.10
+    sp = rx * 0.27
+    for sx in (-1, 1):
+        px = ex + sx * sp
+        if blink:
+            d.line([(S(px - rx * 0.13), S(ey)), (S(px + rx * 0.13), S(ey))],
+                   fill=BLOB_EYE, width=int(S(1.6)))
+        else:
+            E(px, ey, rx * 0.115, ry * 0.155, fill=BLOB_WHITE)
+            E(px + look * rx * 0.03, ey + ry * 0.02, rx * 0.072, ry * 0.10, fill=BLOB_EYE)
+            E(px - rx * 0.03, ey - ry * 0.05, rx * 0.028, ry * 0.035, fill=BLOB_WHITE)
+    mw = rx * 0.17
+    d.arc([S(ex - mw), S(ey + ry * 0.16), S(ex + mw), S(ey + ry * 0.16 + ry * 0.35)],
+          start=10, end=170, fill=BLOB_EYE, width=int(S(1.5)))
+
+    img = img.resize((size, size), Image.LANCZOS)
+    r, g, b, a = img.split()
+    a = a.point(lambda v: 255 if v >= 128 else 0)             # clean colour-key edges
+    img = Image.merge("RGBA", (r, g, b, a))
+    out = Image.new("RGBA", (size, size), MAGENTA_OPAQUE)
+    out.paste(img, (0, 0), img)
+    return out
+
+
+def _blob_pose(pose: str, p: float) -> tuple[float, float, bool]:
+    """(rise, squash, blink) for a pose at cycle position p."""
+    if pose in ("walk", "jump"):
+        # anticipate (crouch) -> launch -> arc -> land -> wobble out
+        if p < 0.18:
+            return 0.0, 1.0 + 0.22 * math.sin((p / 0.18) * math.pi), False
+        if p < 0.80:
+            u = (p - 0.18) / 0.62
+            return math.sin(u * math.pi) * 34, 1.0 - 0.20 * math.sin(u * math.pi), False
+        u = (p - 0.80) / 0.20
+        return 0.0, 1.0 + 0.26 * math.sin(u * math.pi) * math.cos(u * math.pi * 3), False
+    if pose == "sleep":
+        return 0.0, 1.34 + 0.05 * math.sin(p * 2 * math.pi), True
+    if pose == "sit":
+        return 0.0, 1.16 + 0.03 * math.sin(p * 2 * math.pi), p % 1.0 < 0.06
+    if pose == "swipe":
+        return 0.0, 1.0 + 0.30 * math.sin(p * math.pi), False
+    return 0.0, 1.0 + 0.055 * math.sin(p * 2 * math.pi), p % 1.0 < 0.07   # idle
+
+
+class BlobSource:
+    """The built-in procedural character. Same interface as SpriteSource."""
+
+    FRAMES = 24                  # sampling resolution of the continuous motion
+    handles_own_bob = True       # its hop already carries the vertical motion
+
+    def __init__(self, size: int):
+        self.size = size
+        self.origin = "builtin:blob (procedural)"
+        self.catalog: dict[tuple[str, str], list[str]] = {}
+        self._cache: dict[tuple[str, int, bool], Image.Image] = {}
+
+    def frame(self, pose: str, phase: float, face_left: bool) -> Image.Image:
+        idx = int(phase * self.FRAMES) % self.FRAMES
+        key = (pose, idx, face_left)
+        if key not in self._cache:
+            rise, squash, blink = _blob_pose(pose, idx / self.FRAMES)
+            img = _blob_frame(rise, squash, look=1.0, blink=blink, size=self.size)
+            if face_left:
+                img = img.transpose(Image.FLIP_LEFT_RIGHT)
+            self._cache[key] = img
+        return self._cache[key]
+
+    def frame_count(self, pose: str) -> int:
+        return self.FRAMES
+
+    def describe(self) -> str:
+        return f"[sprite] source={self.origin} — {self.FRAMES} sampled frames/pose, continuous motion"
+
+    def contact_sheet(self, path: str):
+        poses = ("walk", "idle", "sit", "sleep", "swipe")
+        sheet = Image.new("RGB", (self.size * 8, self.size * len(poses)), (240, 240, 244))
+        for r, pose in enumerate(poses):
+            for c in range(8):
+                f = self.frame(pose, c / 8, False)
+                sheet.paste(f.convert("RGB"), (c * self.size, r * self.size))
+        sheet.save(path)
+
+
 class SpriteSource:
     """Discovers and loads cat animations from assets/cat/, else oneko."""
+
+    handles_own_bob = False
 
     def __init__(self, size: int):
         self.size = size
@@ -443,11 +614,17 @@ class SpriteSource:
         sheet.save(path)
 
 
-SPRITES: SpriteSource | None = None  # initialised in main(), after CAT_SIZE is known
+SPRITES = None            # initialised in main(), after CAT_SIZE is known
+# Some packs draw the character facing LEFT. Rendering assumes it faces right
+# and mirrors for leftward travel, so a left-facing pack walks backwards
+# unless this is flipped (CLI: --flip).
+SPRITE_FACES_LEFT = False
 
 
 def draw_cat(pose: str, phase: float, face_left: bool) -> Image.Image:
     """One animation frame. pose: walk|idle|sit|sleep|jump|swipe|groom."""
+    if SPRITE_FACES_LEFT:
+        face_left = not face_left      # art already faces left; invert the mirror
     return SPRITES.frame(pose, phase, face_left)
 
 
@@ -1281,7 +1458,8 @@ class PawmatePrototype:
                 # One bounce per footfall (two per stride cycle), driven by the
                 # same distance-synced phase as the legs, so the bounce lands
                 # with the steps instead of drifting against them.
-                bob = abs(math.sin(st.phase * 2 * math.pi)) * WALK_BOB_PX
+                bob = (0.0 if getattr(SPRITES, "handles_own_bob", False)
+                       else abs(math.sin(st.phase * 2 * math.pi)) * WALK_BOB_PX)
             else:
                 st.phase = (st.phase + dt * IDLE_CYCLE_HZ) % 1.0
                 bob = math.sin(st.phase * 2 * math.pi) * IDLE_BOB_PX if st.pose in ("idle", "sit") else 0.0
@@ -1298,8 +1476,15 @@ class PawmatePrototype:
 
 
 def main():
-    global SPRITES
-    SPRITES = SpriteSource(CAT_SIZE)
+    global SPRITES, SPRITE_FACES_LEFT
+    if "--flip" in sys.argv:
+        SPRITE_FACES_LEFT = not SPRITE_FACES_LEFT
+    # The procedural blob is the default: it always works, needs no download,
+    # and is smooth at any sampling rate. --sprites opts into a pack instead.
+    if "--sprites" in sys.argv:
+        SPRITES = SpriteSource(CAT_SIZE)
+    else:
+        SPRITES = BlobSource(CAT_SIZE)
     print(SPRITES.describe())
 
     if "--inspect" in sys.argv:
