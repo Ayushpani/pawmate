@@ -75,6 +75,9 @@ except ImportError:
 
 from PIL import Image, ImageTk
 
+import pawmate_ui as ui
+from pawmate_tracking import ActivityTracker, Store, fmt_minutes
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -93,7 +96,9 @@ IDLE_CYCLE_HZ = 0.5             # frame swaps/sec at rest (breathing-speed, not 
 IDLE_BOB_PX = 2.5               # small vertical bob while idle/sit, so rest is never perfectly frozen
 WALK_BOB_PX = 2.5               # body bounce per footfall — with a low-frame-count sprite this is
                                  # most of what separates "walking" from "a picture being dragged"
-JUMP_HEIGHT_PX = 40.0           # how high the window actually rises during the jump action
+JUMP_HEIGHT_PX = 40.0
+WATER_EVERY_S = 45 * 60         # plan default: a glass every 45 active minutes
+BREAK_EVERY_S = 50 * 60         # plan default: a break after 50 minutes           # how high the window actually rises during the jump action
 IDLE_MIN_S, IDLE_MAX_S = 2.0, 5.0
 PAUSE_AT_TARGET_MIN_S, PAUSE_AT_TARGET_MAX_S = 1.5, 4.0
 SLEEP_AFTER_IDLE_CYCLES = 4     # after this many idle->walk loops with no user interaction, nap
@@ -377,6 +382,9 @@ BLOB_HILITE = (168, 234, 216, 255)
 BLOB_EYE = (28, 42, 48, 255)
 BLOB_WHITE = (255, 255, 255, 255)
 BLOB_SHADOW = (150, 120, 160, 255)
+BLOB_EYE_HEX = "#1c2a30"
+BLOB_WHITE_HEX = "#ffffff"
+GAZE_FOLLOW_HZ = 9.0            # how fast the eyes catch up to the cursor
 _BLOB_SS = 4
 _BLOB_GROUND = 108.0
 _BLOB_LOGICAL = 128
@@ -413,17 +421,10 @@ def _blob_frame(rise: float, squash: float, look: float = 1.0, blink: bool = Fal
     E(cx, cy, rx, ry * 0.99, fill=BLOB_BODY)
     E(cx - rx * 0.34, cy - ry * 0.40, rx * 0.26, ry * 0.19, fill=BLOB_HILITE)
 
-    ex, ey = cx + look * rx * 0.22, cy - ry * 0.10
-    sp = rx * 0.27
-    for sx in (-1, 1):
-        px = ex + sx * sp
-        if blink:
-            d.line([(S(px - rx * 0.13), S(ey)), (S(px + rx * 0.13), S(ey))],
-                   fill=BLOB_EYE, width=int(S(1.6)))
-        else:
-            E(px, ey, rx * 0.115, ry * 0.155, fill=BLOB_WHITE)
-            E(px + look * rx * 0.03, ey + ry * 0.02, rx * 0.072, ry * 0.10, fill=BLOB_EYE)
-            E(px - rx * 0.03, ey - ry * 0.05, rx * 0.028, ry * 0.035, fill=BLOB_WHITE)
+    # Eyes are NOT baked in here — they're drawn as live canvas items on top so
+    # they can track the cursor continuously. Caching a frame per look-direction
+    # would mean thousands of pre-rendered images; this is one image per pose.
+    ex, ey = cx, cy - ry * 0.10
     mw = rx * 0.17
     d.arc([S(ex - mw), S(ey + ry * 0.16), S(ex + mw), S(ey + ry * 0.16 + ry * 0.35)],
           start=10, end=170, fill=BLOB_EYE, width=int(S(1.5)))
@@ -455,6 +456,27 @@ def _blob_pose(pose: str, p: float) -> tuple[float, float, bool]:
     if pose == "swipe":
         return 0.0, 1.0 + 0.30 * math.sin(p * math.pi), False
     return 0.0, 1.0 + 0.055 * math.sin(p * 2 * math.pi), p % 1.0 < 0.07   # idle
+
+
+def blob_eye_layout(pose: str, phase: float, size: int = 128) -> dict:
+    """Where the eyes sit for this pose/phase, in final image pixels.
+
+    Mirrors the body maths in _blob_frame so canvas-drawn eyes stay glued to
+    the squashing, hopping body.
+    """
+    rise, squash, blink = _blob_pose(pose, phase)
+    k = size / float(_BLOB_LOGICAL)
+    r0 = 30.0
+    rx, ry = r0 * squash, r0 / squash
+    cx, cy = 64.0, _BLOB_GROUND - ry - rise
+    return {
+        "cx": cx * k, "cy": (cy - ry * 0.10) * k,
+        "spacing": rx * 0.27 * k,
+        "white_rx": rx * 0.115 * k, "white_ry": ry * 0.155 * k,
+        "pupil_rx": rx * 0.072 * k, "pupil_ry": ry * 0.10 * k,
+        "travel_x": rx * 0.085 * k, "travel_y": ry * 0.075 * k,
+        "blink": blink,
+    }
 
 
 class BlobSource:
@@ -1032,6 +1054,20 @@ def parse_local_command(text: str) -> dict | None:
         return {"action": "pose", "target": "sleep"}
     if t in ("idle", "stand"):
         return {"action": "pose", "target": "idle"}
+    if t in ("today", "stats", "report", "/today", "dashboard"):
+        return {"action": "stats", "target": ""}
+    if t in ("water", "/water", "drink"):
+        return {"action": "water", "target": ""}
+    if t in ("resume", "/resume"):
+        return {"action": "resume_tracking", "target": ""}
+    m = re.match(r"^/?focus\s*(\d+)?", t)
+    if m and t.startswith(("focus", "/focus")):
+        return {"action": "focus", "target": m.group(1) or "25"}
+    m = re.match(r"^/?pause\s*(\d+)?\s*(m|min|h)?", t)
+    if m and t.startswith(("pause", "/pause")):
+        n = float(m.group(1) or 30)
+        secs = n * 3600 if (m.group(2) or "").startswith("h") else n * 60
+        return {"action": "pause_tracking", "target": str(secs)}
     if t.startswith("open "):
         return {"action": "open_app", "target": text[5:].strip()}
     if t.startswith("close "):
@@ -1060,10 +1096,16 @@ class PetState:
     action: str | None = None
     action_phase: float = 0.0
     action_duration: float = 0.9
+    # smoothed gaze direction, -1..1 on each axis
+    look_x: float = 0.0
+    look_y: float = 0.0
 
 
 class PawmatePrototype:
     def __init__(self):
+        global SPRITES
+        if SPRITES is None:          # constructing directly (tests/imports) must still work
+            SPRITES = BlobSource(CAT_SIZE)
         self.root = tk.Tk()
         self.root.title("Pawmate")
         self.root.overrideredirect(True)
@@ -1093,6 +1135,18 @@ class PawmatePrototype:
 
         self.app_index = AppIndex()
         self.app_index.start()
+
+        # eyes are canvas items layered over the body image so they can follow
+        # the cursor continuously (see blob_eye_layout)
+        self.eye_items: list[int] = []
+
+        self.store = Store()
+        self.tracker = ActivityTracker(self.store)
+        self.tracker.start()
+        self._bubble = None
+        self._last_water = time.time()
+        self._last_break = time.time()
+        self.root.after(WATER_EVERY_S * 1000 // 4, self._check_reminders)
 
         self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
         self.canvas.bind("<B1-Motion>", self._on_drag_move)
@@ -1248,6 +1302,23 @@ class PawmatePrototype:
         menu.add_command(label="Chat / command…", command=self._open_chat)
         menu.add_command(label="Open app…", command=self._prompt_open_app)
         menu.add_separator()
+        menu.add_command(label="📊  Today's activity", command=self._show_dashboard)
+        menu.add_command(label="💧  Log a glass of water", command=self._log_water)
+
+        focus_menu = tk.Menu(menu, tearoff=0)
+        for m in (15, 25, 50):
+            focus_menu.add_command(label=f"{m} minutes", command=lambda mm=m: self._start_focus(mm))
+        menu.add_cascade(label="🛡  Focus session", menu=focus_menu)
+
+        track_menu = tk.Menu(menu, tearoff=0)
+        if self.tracker.paused:
+            track_menu.add_command(label="Resume tracking", command=self._resume_tracking)
+        else:
+            for label, secs in (("Pause 15 min", 900), ("Pause 1 hour", 3600),
+                                ("Pause until tomorrow", 12 * 3600)):
+                track_menu.add_command(label=label, command=lambda sx=secs: self._pause_tracking(sx))
+        menu.add_cascade(label="⏸  Tracking", menu=track_menu)
+        menu.add_separator()
 
         close_menu = tk.Menu(menu, tearoff=0)
         windows = list_visible_windows()
@@ -1263,11 +1334,19 @@ class PawmatePrototype:
         menu.add_command(label="Sleep", command=lambda: self._set_pose("sleep"))
         menu.add_command(label="Walk", command=lambda: self._set_pose("walk"))
         menu.add_separator()
-        menu.add_command(label="Quit", command=self.root.destroy)
+        menu.add_command(label="Quit", command=self._quit)
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
+    def _pause_tracking(self, seconds: float):
+        self.tracker.pause(seconds)
+        ui.toast(self.root, f"tracking paused for {int(seconds // 60)} min")
+
+    def _resume_tracking(self):
+        self.tracker.resume()
+        ui.toast(self.root, "tracking resumed")
 
     def _set_pose(self, pose: str):
         self.state.pose = pose
@@ -1279,9 +1358,10 @@ class PawmatePrototype:
 
     # -- app open (dynamic index + fuzzy "did you mean") --
     def _prompt_open_app(self):
-        query = simpledialog.askstring("Pawmate", "Open which app?", parent=self.root)
-        if query:
-            self._open_app_query(query)
+        ui.CommandBar(self.root, self._open_app_query,
+                      hint="Type any installed app name. Typos are fine — "
+                           "it'll ask if you meant something close.",
+                      suggestions=("notepad", "chrome", "calculator", "spotify"))
 
     def _open_app_query(self, query: str):
         query = query.strip()
@@ -1292,34 +1372,35 @@ class PawmatePrototype:
             self._launch_resolved(payload)
         elif kind == "fuzzy":
             name = payload["name"]
-            if messagebox.askyesno("Pawmate", f'No app called "{query}" — did you mean "{name}"?'):
-                self._launch_resolved(payload)
+            ui.confirm(self.root, f'No app called "{query}".\nDid you mean "{name}"?',
+                       on_yes=lambda: self._launch_resolved(payload), yes="Open it")
         else:  # "none"
             suggestions = payload
             msg = f'No app found matching "{query}".'
             if suggestions:
-                msg += "\nClosest matches: " + ", ".join(suggestions)
+                msg += "  Closest: " + ", ".join(suggestions)
             elif not self.app_index.ready.is_set():
-                msg += "\n(still indexing installed apps — try again in a moment)"
-            messagebox.showinfo("Pawmate", msg)
+                msg += "  (still indexing installed apps — try again in a moment)"
+            ui.toast(self.root, msg, ok=False)
 
     def _launch_resolved(self, entry: dict):
         try:
             self.app_index.launch(entry)
             self._play_action("jump", duration=0.7)  # long enough for the arc to read as an arc
         except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Pawmate", f'Couldn\'t open "{entry["name"]}":\n{exc}')
+            ui.toast(self.root, f'Couldn\'t open "{entry["name"]}": {exc}', ok=False)
 
     # -- app close (live running windows, confirm, fuzzy match) --
     def _close_app_confirm(self, hwnd: int, title: str):
         # Destructive action = human click, per the plan's principle.
-        if not messagebox.askyesno("Pawmate — confirm", f'Close "{title}"?'):
-            return
-        try:
-            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
-            self._play_action("swipe", duration=0.45)  # a swipe is quick, not a slow flicker
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Pawmate", f"Couldn't close that window:\n{exc}")
+        def do_close():
+            try:
+                win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                self._play_action("swipe", duration=0.45)
+                ui.toast(self.root, f'closed "{title[:40]}"')
+            except Exception as exc:  # noqa: BLE001
+                ui.toast(self.root, f"Couldn't close that window: {exc}", ok=False)
+        ui.confirm(self.root, f'Close "{title}"?', on_yes=do_close, yes="Close it")
 
     def _close_app_by_title_substring(self, substring: str):
         substring = substring.strip()
@@ -1336,10 +1417,113 @@ class PawmatePrototype:
         close = difflib.get_close_matches(substring, titles.keys(), n=1, cutoff=0.5)
         if close:
             title = close[0]
-            if messagebox.askyesno("Pawmate", f'No open window matching "{substring}" — did you mean "{title}"?'):
-                self._close_app_confirm(titles[title], title)
+            ui.confirm(self.root, f'No window matching "{substring}".\nDid you mean "{title}"?',
+                       on_yes=lambda: self._close_app_confirm(titles[title], title),
+                       yes="That one")
             return
-        messagebox.showinfo("Pawmate", f'No open window matching "{substring}".')
+        ui.toast(self.root, f'No open window matching "{substring}".', ok=False)
+
+    # -- gaze: eyes follow the cursor --
+    def _update_gaze(self, dt: float, pose: str, phase: float):
+        st = self.state
+        try:
+            px, py = self.root.winfo_pointerxy()
+        except Exception:  # noqa: BLE001
+            return
+        cx = st.x + CAT_SIZE / 2
+        cy = st.y + CAT_SIZE / 2
+        dx, dy = px - cx, py - cy
+        dist = math.hypot(dx, dy)
+        if dist < 1.0:
+            tx = ty = 0.0
+        else:
+            # saturate: past ~340px away the gaze is already fully deflected,
+            # so distant cursor movement doesn't keep yanking the eyes
+            reach = min(1.0, dist / 340.0)
+            tx, ty = (dx / dist) * reach, (dy / dist) * reach
+        k = min(1.0, dt * GAZE_FOLLOW_HZ)          # critically-damped-ish smoothing
+        st.look_x += (tx - st.look_x) * k
+        st.look_y += (ty - st.look_y) * k
+        self._draw_eyes(pose, phase)
+
+    def _draw_eyes(self, pose: str, phase: float):
+        for i in self.eye_items:
+            self.canvas.delete(i)
+        self.eye_items = []
+        if not isinstance(SPRITES, BlobSource):
+            return                                   # sprite packs draw their own eyes
+        lay = blob_eye_layout(pose, phase, CAT_SIZE)
+        st = self.state
+        cx, cy = lay["cx"], lay["cy"]
+        sp = lay["spacing"]
+        lx = st.look_x * lay["travel_x"]
+        ly = st.look_y * lay["travel_y"]
+        for sx in (-1, 1):
+            ex = cx + sx * sp
+            if lay["blink"] or pose == "sleep":
+                self.eye_items.append(self.canvas.create_line(
+                    ex - lay["white_rx"], cy, ex + lay["white_rx"], cy,
+                    fill=BLOB_EYE_HEX, width=2, capstyle="round"))
+                continue
+            self.eye_items.append(self.canvas.create_oval(
+                ex - lay["white_rx"], cy - lay["white_ry"],
+                ex + lay["white_rx"], cy + lay["white_ry"],
+                fill=BLOB_WHITE_HEX, outline=""))
+            self.eye_items.append(self.canvas.create_oval(
+                ex + lx - lay["pupil_rx"], cy + ly - lay["pupil_ry"],
+                ex + lx + lay["pupil_rx"], cy + ly + lay["pupil_ry"],
+                fill=BLOB_EYE_HEX, outline=""))
+            self.eye_items.append(self.canvas.create_oval(
+                ex + lx - lay["pupil_rx"] * 0.9, cy + ly - lay["pupil_ry"] * 0.95,
+                ex + lx - lay["pupil_rx"] * 0.2, cy + ly - lay["pupil_ry"] * 0.3,
+                fill=BLOB_WHITE_HEX, outline=""))
+
+    # -- speech bubbles + wellbeing nudges --
+    def say(self, text: str, actions=None, timeout_ms: int = 6000):
+        try:
+            if self._bubble and self._bubble.winfo_exists():
+                self._bubble.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+        self._bubble = ui.Bubble(self.root, text,
+                                 int(self.state.x + CAT_SIZE / 2), int(self.state.y),
+                                 actions=actions, timeout_ms=timeout_ms)
+
+    def _check_reminders(self):
+        """Water / break nudges (plan W1), paced off real activity."""
+        self.root.after(60_000, self._check_reminders)
+        if self.tracker.paused:
+            return
+        now = time.time()
+        try:
+            idle = __import__("pawmate_tracking").idle_seconds()
+        except Exception:  # noqa: BLE001
+            idle = 0.0
+        if idle > 180:
+            self._last_break = now          # away from the desk counts as a break
+            return
+        if now - self._last_water >= WATER_EVERY_S:
+            self._last_water = now
+            self.say("time for some water 💧",
+                     actions=[("Done", self._log_water), ("Later", lambda: None)],
+                     timeout_ms=15000)
+        elif now - self._last_break >= BREAK_EVERY_S:
+            self._last_break = now
+            self.say("you've been at it 50 min.\nstretch for a bit?",
+                     actions=[("OK", lambda: None)], timeout_ms=15000)
+
+    def _log_water(self):
+        self.store.log_water()
+        self._last_water = time.time()
+        self._play_action("jump", duration=0.7)
+        ui.toast(self.root, f"logged 💧 — {self.store.water_count()} today")
+
+    def _show_dashboard(self):
+        stats = self.tracker.live_stats()
+        dash = ui.Dashboard(self.root, stats, on_water=self._log_water)
+        segs = self.store.segments()
+        day_start = self.store.day_bounds()[0]
+        dash.after(120, lambda: dash.draw_timeline(segs, day_start))
 
     # -- one-shot action animation (jump on open, swipe on close) --
     def _play_action(self, name: str, duration: float = 0.9):
@@ -1350,20 +1534,18 @@ class PawmatePrototype:
 
     # -- chat / command bar --
     def _open_chat(self):
-        text = simpledialog.askstring(
-            "Pawmate",
-            "Command (try: open notepad / close chrome / walk / sit / sleep)"
-            + ("\nFree-text also works — AI is connected." if (OPENROUTER_API_KEY or (CF_ACCOUNT_ID and CF_API_TOKEN)) else
-               "\nSet OPENROUTER_API_KEY to also accept free-text via AI."),
-            parent=self.root,
-        )
-        if not text:
-            return
+        ai = bool(OPENROUTER_API_KEY or (CF_ACCOUNT_ID and CF_API_TOKEN))
+        hint = ("Free text works too — AI is connected." if ai else
+                "Set OPENROUTER_API_KEY to also accept free text via AI.")
+        ui.CommandBar(self.root, self._handle_command, hint=hint,
+                      suggestions=("open notepad", "today", "water", "focus 25", "sleep"))
+
+    def _handle_command(self, text: str):
         action = parse_local_command(text)
         if action is None:
             action = ask_llm(text)
         if action is None:
-            messagebox.showinfo("Pawmate", "Didn't understand that — try a command like 'open notepad'.")
+            ui.toast(self.root, "Didn't catch that — try 'open notepad' or 'today'.", ok=False)
             return
         self._dispatch_action(action)
 
@@ -1376,10 +1558,39 @@ class PawmatePrototype:
             self._open_app_query(target)
         elif kind == "close_app":
             self._close_app_by_title_substring(target)
+        elif kind == "stats":
+            self._show_dashboard()
+        elif kind == "water":
+            self._log_water()
+        elif kind == "focus":
+            self._start_focus(int(target or 25))
+        elif kind == "pause_tracking":
+            self.tracker.pause(float(target or 1800))
+            ui.toast(self.root, f"tracking paused for {int(float(target or 1800) // 60)} min")
+        elif kind == "resume_tracking":
+            self.tracker.resume()
+            ui.toast(self.root, "tracking resumed")
         elif kind == "say":
-            messagebox.showinfo("Pawmate says", target or "…")
+            self.say(target or "…")
         else:
-            messagebox.showinfo("Pawmate", f"Unrecognized action: {action}")
+            ui.toast(self.root, f"Not sure how to do that: {action}", ok=False)
+
+    # -- focus sessions (plan W3) --
+    def _start_focus(self, minutes: int):
+        minutes = max(1, min(180, minutes))
+        self.focus_until = time.time() + minutes * 60
+        self._set_pose("sit")
+        self.say(f"focus session: {minutes} min.\ni'll sit guard 🛡", timeout_ms=5000)
+        self.root.after(minutes * 60 * 1000, self._end_focus)
+
+    def _end_focus(self):
+        if not getattr(self, "focus_until", 0):
+            return
+        self.focus_until = 0
+        stats = self.tracker.live_stats()
+        self._play_action("jump", duration=0.7)
+        self.say(f"focus done 🎉\n{fmt_minutes(stats['deep_work_min'])} deep work today",
+                 actions=[("See today", self._show_dashboard)], timeout_ms=12000)
 
     # -- main loop --
     def _tick(self):
@@ -1409,6 +1620,7 @@ class PawmatePrototype:
                 img = self.sprites.get(st.action, st.action_phase, st.facing_left)
                 self.canvas.itemconfig(self.image_id, image=img)
                 self._current_image_ref = img
+                self._update_gaze(dt, st.action, st.action_phase)
                 self.root.after(TICK_MS, self._tick)
                 return
 
@@ -1468,10 +1680,19 @@ class PawmatePrototype:
         img = self.sprites.get(st.pose, st.phase, st.facing_left)
         self.canvas.itemconfig(self.image_id, image=img)
         self._current_image_ref = img  # keep a reference so Tk doesn't GC it
+        self._update_gaze(dt, st.pose, st.phase)
 
         self.root.after(TICK_MS, self._tick)
 
+    def _quit(self):
+        try:
+            self.tracker.stop()          # flush the in-flight segment before exiting
+        except Exception:  # noqa: BLE001
+            pass
+        self.root.destroy()
+
     def run(self):
+        self.root.protocol("WM_DELETE_WINDOW", self._quit)
         self.root.mainloop()
 
 

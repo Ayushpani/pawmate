@@ -83,6 +83,46 @@ square frames (width being an exact multiple of height). Non-square frames
 are letterboxed with the feet aligned to the bottom, so a cat isn't left
 floating.
 
+## What it actually does now
+
+Beyond roaming around, it implements the core of the master plan:
+
+**Activity tracking (plan T1/T2/T3)** — samples the foreground app + window
+title every 2s, detects idle (2 min threshold), coalesces into segments, and
+stores them in local SQLite at `%LOCALAPPDATA%\Pawmate\pawmate.db`.
+Categorises productive / neutral / distracting by window title first, then
+exe — so a browser counts as productive on docs and distracting on YouTube,
+which the exe alone can't tell you. **Nothing leaves your machine**: the
+tracking module has no network code in it at all.
+
+**Today's dashboard (plan T5/R1)** — right-click → *Today's activity*, or
+type `today`. Focus score, active/deep-work/distracting time, a
+where-the-time-went split, a 24h timeline, and top apps with bars.
+
+The score is the plan's deterministic formula, not a vibe:
+`100 × (0.50·P + 0.30·DW + 0.20·B) × (1 − 0.25·S)` — productive ratio, deep
+work vs a 180min target, breaks, penalised by switching rate. Deep work only
+counts contiguous productive blocks of 25min+.
+
+**Wellbeing nudges (plan W1)** — water every 45 min and a stretch reminder
+every 50 min, delivered as a speech bubble with buttons, and paced off real
+activity (being away from the desk counts as a break, so it won't nag an
+empty chair).
+
+**Focus sessions (plan W3)** — right-click → *Focus session*, or `focus 25`.
+It sits and guards, then celebrates with your deep-work total.
+
+**Pause tracking** — right-click → *Tracking* → 15 min / 1 hour / until
+tomorrow. Password managers are excluded from tracking by default.
+
+**Eyes follow your cursor.** Drawn as live canvas items over the body rather
+than baked into frames, so the gaze is continuous instead of needing a
+cached image per direction.
+
+**Commands** (double-click the pet, or right-click → Chat):
+`today` · `water` · `focus 25` · `pause 30m` · `resume` ·
+`open <app>` · `close <app>` · `walk` / `sit` / `sleep`
+
 ## Motion, not just art
 
 Three separate things were making it read as a slideshow rather than an
