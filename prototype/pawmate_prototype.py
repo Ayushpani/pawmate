@@ -75,11 +75,14 @@ except ImportError:
 
 from PIL import Image, ImageTk
 
-import pawmate_ui as ui
+import pawmate_digest as digest
 import pawmate_hotkey as hotkeys
+import pawmate_ui as ui
 from pawmate_breaks import BreakOverlay, BreakScheduler
-from pawmate_tracking import (ActivityTracker, Settings, Store, Todos, UserRules,
-                              categorise_with, fmt_minutes, foreground_app, idle_seconds)
+from pawmate_classify import AdaptiveClassifier
+from pawmate_git import GitWatcher
+from pawmate_tracking import (ActivityTracker, Settings, Store, Todos,
+                              fmt_minutes, foreground_app, idle_seconds)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -1057,6 +1060,10 @@ def parse_local_command(text: str) -> dict | None:
         return {"action": "pose", "target": "sleep"}
     if t in ("idle", "stand"):
         return {"action": "pose", "target": "idle"}
+    if t in ("log", "standup", "daily log", "/standup", "/log", "summary"):
+        return {"action": "digest", "target": ""}
+    if t in ("projects", "repos", "/projects", "git"):
+        return {"action": "projects", "target": ""}
     if t in ("tasks", "todos", "todo list", "/todo", "/tasks"):
         return {"action": "todos", "target": ""}
     if t in ("settings", "/settings", "preferences"):
@@ -1158,11 +1165,15 @@ class PawmatePrototype:
 
         self.store = Store()
         self.settings = Settings(self.store)
-        self.rules = UserRules(self.store)
+        self.classifier = AdaptiveClassifier(self.store)
         self.todos = Todos(self.store)
+        self.git = GitWatcher(self.store)
+        self.git.start()
         self.tracker = ActivityTracker(self.store)
-        self.tracker.rules = self.rules          # user overrides win when categorising
+        self.tracker.classifier = self.classifier   # learned categories, not fixed rules
+        self.tracker.git = self.git                 # repo/branch attribution
         self.tracker.settings = self.settings
+        self.tracker.context = self                 # for focus/todo learning signals
         self.tracker.start()
         self._bubble = None
         self._overlay = None
@@ -1329,20 +1340,23 @@ class PawmatePrototype:
     # is genuinely different information, not a duplicate control.
     def _on_right_click(self, event):
         menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label="🐈 Pawmate prototype", state="disabled")
+        menu.add_command(label="Pawmate", state="disabled")
         menu.add_separator()
         menu.add_command(label="Chat / command…", command=self._open_chat)
         menu.add_command(label="Open app…", command=self._prompt_open_app)
         menu.add_separator()
-        menu.add_command(label="📊  Today's activity", command=self._show_dashboard)
-        menu.add_command(label="✅  Today's tasks", command=self._show_todos)
-        menu.add_command(label="💧  Log a glass of water", command=self._log_water)
-        menu.add_command(label="🏷  Re-tag what I'm using now", command=self._retag_current)
+        menu.add_command(label="Today", command=self._show_dashboard)
+        menu.add_command(label="Daily log", command=self._show_digest)
+        menu.add_command(label="Projects", command=self._show_projects)
+        menu.add_command(label="Tasks", command=self._show_todos)
+        menu.add_separator()
+        menu.add_command(label="Log a glass of water", command=self._log_water)
+        menu.add_command(label="Re-categorise what I'm using", command=self._retag_current)
 
         focus_menu = tk.Menu(menu, tearoff=0)
         for m in (15, 25, 50):
             focus_menu.add_command(label=f"{m} minutes", command=lambda mm=m: self._start_focus(mm))
-        menu.add_cascade(label="🛡  Focus session", menu=focus_menu)
+        menu.add_cascade(label="Focus session", menu=focus_menu)
 
         track_menu = tk.Menu(menu, tearoff=0)
         if self.tracker.paused:
@@ -1351,7 +1365,7 @@ class PawmatePrototype:
             for label, secs in (("Pause 15 min", 900), ("Pause 1 hour", 3600),
                                 ("Pause until tomorrow", 12 * 3600)):
                 track_menu.add_command(label=label, command=lambda sx=secs: self._pause_tracking(sx))
-        menu.add_cascade(label="⏸  Tracking", menu=track_menu)
+        menu.add_cascade(label="Tracking", menu=track_menu)
         menu.add_separator()
 
         close_menu = tk.Menu(menu, tearoff=0)
@@ -1368,7 +1382,7 @@ class PawmatePrototype:
         menu.add_command(label="Sleep", command=lambda: self._set_pose("sleep"))
         menu.add_command(label="Walk", command=lambda: self._set_pose("walk"))
         menu.add_separator()
-        menu.add_command(label="⚙  Settings", command=self._show_settings)
+        menu.add_command(label="Settings", command=self._show_settings)
         menu.add_command(label="Quit", command=self._quit)
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -1594,7 +1608,7 @@ class PawmatePrototype:
         if dt <= 0 or dt > 300:
             return
         exe, title = foreground_app()
-        cat = categorise_with(self.rules, exe, title)
+        cat = self.classifier.categorise(exe, title)
         if idle_seconds() > 120:
             return
         self.todos.add_spent(todo["id"], dt)
@@ -1613,38 +1627,65 @@ class PawmatePrototype:
 
     def _show_settings(self):
         ui.SettingsPanel(self.root, self.settings, on_save=self._settings_saved,
-                         rules=self.rules)
+                         classifier=self.classifier)
 
     def _settings_saved(self):
         self.tracker.reload_settings()
         ui.toast(self.root, "settings saved")
 
     def _retag_current(self):
+        """Correct the category of whatever is focused, and learn from it."""
         exe, title = foreground_app()
         if not exe and not title:
-            ui.toast(self.root, "nothing focused to re-tag", ok=False)
+            ui.toast(self.root, "nothing focused to re-categorise", ok=False)
             return
+        verdict = self.classifier.classify(exe, title)
 
-        def apply(pattern: str, category: str):
-            if not pattern:
+        def apply(scope: str, category: str):
+            scope = (scope or "").strip().lower()
+            if not scope:
                 return
-            kind = "title" if pattern.lower() in (title or "").lower() else "exe"
-            self.rules.add(kind, pattern, category)
-            ui.toast(self.root, f'"{pattern}" is now {category}')
-        ui.RetagDialog(self.root, exe, title, apply)
+            self.classifier.teach(exe, title, category, explicit=True,
+                                  focus_tokens=[scope])
+            ui.toast(self.root, f'"{scope.replace("exe:", "")}" is {category} from now on')
+        ui.RetagDialog(self.root, exe, title, verdict, apply)
 
+    # -- reporting --
     def _log_water(self):
         self.store.log_water()
-        self._last_water = time.time()
+        self.breaks.reset("water")
         self._play_action("jump", duration=0.7)
-        ui.toast(self.root, f"logged 💧 — {self.store.water_count()} today")
+        goal = int(self.settings.get("water_goal") or 8)
+        n = self.store.water_count()
+        ui.toast(self.root, f"logged. {n} of {goal} glasses today")
 
     def _show_dashboard(self):
-        stats = self.tracker.live_stats()
-        dash = ui.Dashboard(self.root, stats, on_water=self._log_water)
-        segs = self.store.segments()
-        day_start = self.store.day_bounds()[0]
-        dash.after(120, lambda: dash.draw_timeline(segs, day_start))
+        ui.Dashboard(self.root, self.tracker.live_stats(),
+                     segments=self.store.segments(),
+                     day_start=self.store.day_bounds()[0],
+                     on_water=self._log_water, on_digest=self._show_digest)
+
+    def _build_digest(self, day_offset: int = 0):
+        stats = self.tracker.live_stats(day_offset)
+        segs = self.store.segments(day_offset)
+        a, b = self.store.day_bounds(day_offset)
+        repos = self.git.day_report(a, b)
+        rows = self.todos.list()
+        return digest.build(stats, segs, repos,
+                            [r for r in rows if r["done"]],
+                            [r for r in rows if not r["done"]], a)
+
+    def _show_digest(self):
+        d = self._build_digest()
+        ui.DigestPanel(self.root, d, digest.render_standup(d),
+                       digest.render_detail(d), digest.insights(d))
+
+    def _show_projects(self):
+        a, b = self.store.day_bounds()
+        report = self.git.day_report(a, b)
+        note = ("git not found on PATH" if not self.git.available
+                else f"{len(self.git.repos)} repositories watched")
+        ui.ProjectsPanel(self.root, report, note)
 
     # -- one-shot action animation (jump on open, swipe on close) --
     def _play_action(self, name: str, duration: float = 0.9):
@@ -1661,7 +1702,7 @@ class PawmatePrototype:
         if getattr(self, "hotkeys", None) and self.hotkeys.ok:
             hint = f"{hotkeys.describe(self.hotkeys.spec)} opens this from anywhere.  " + hint
         ui.CommandBar(self.root, self._handle_command, hint=hint,
-                      suggestions=("todo ", "what's left", "today", "focus 25", "open notepad"))
+                      suggestions=("standup", "today", "todo ", "projects", "focus 25"))
 
     def _handle_command(self, text: str):
         action = parse_local_command(text)
@@ -1685,6 +1726,10 @@ class PawmatePrototype:
             self._show_dashboard()
         elif kind == "todos":
             self._show_todos()
+        elif kind == "digest":
+            self._show_digest()
+        elif kind == "projects":
+            self._show_projects()
         elif kind == "settings":
             self._show_settings()
         elif kind == "add_todo":
@@ -1729,7 +1774,7 @@ class PawmatePrototype:
         minutes = max(1, min(180, minutes))
         self.focus_until = time.time() + minutes * 60
         self._set_pose("sit")
-        self.say(f"focus session: {minutes} min.\ni'll sit guard 🛡", timeout_ms=5000)
+        self.say(f"focus session, {minutes} min.\nsitting guard.", timeout_ms=5000)
         self.root.after(minutes * 60 * 1000, self._end_focus)
 
     def _end_focus(self):
@@ -1738,7 +1783,7 @@ class PawmatePrototype:
         self.focus_until = 0
         stats = self.tracker.live_stats()
         self._play_action("jump", duration=0.7)
-        self.say(f"focus done 🎉\n{fmt_minutes(stats['deep_work_min'])} deep work today",
+        self.say(f"focus done. {fmt_minutes(stats['deep_work_min'])} deep work today.",
                  actions=[("See today", self._show_dashboard)], timeout_ms=12000)
 
     # -- main loop --

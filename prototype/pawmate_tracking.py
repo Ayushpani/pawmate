@@ -274,8 +274,10 @@ class ActivityTracker:
 
     def __init__(self, store: Store):
         self.store = store
-        self.rules = None            # set by the app: user category overrides
+        self.classifier = None       # set by the app: adaptive categoriser
+        self.git = None              # set by the app: repo/branch attribution
         self.settings = None         # set by the app: live idle threshold etc.
+        self.context = None          # set by the app: focus/todo state for learning
         self.idle_threshold = IDLE_THRESHOLD_S
         self.paused_until = 0.0
         self.excluded: list[str] = ["keepass", "bitwarden", "1password", "lastpass"]
@@ -352,10 +354,47 @@ class ActivityTracker:
         dur = max(0.0, cur["end"] - cur["start"])
         if dur < MIN_SEGMENT_S:
             return
-        cat = "" if cur["idle"] else categorise_with(self.rules, cur["exe"], cur["title"])
+        cat = ""
+        if not cur["idle"]:
+            if self.classifier:
+                cat = self.classifier.categorise(cur["exe"], cur["title"])
+                self._learn_from(cur, dur)
+            else:
+                cat = categorise(cur["exe"], cur["title"])
+        self._attribute_repo(cur)
         with self._lock:
             self._pending.append((cur["start"], cur["end"], cur["exe"], cur["app"],
                                   cur["title"], cat, cur["idle"]))
+
+    def _learn_from(self, cur: dict, duration: float):
+        """Feed real usage back into the classifier as implicit evidence."""
+        ctx = self.context
+        in_focus = bool(getattr(ctx, "focus_until", 0) and
+                        time.time() < getattr(ctx, "focus_until", 0)) if ctx else False
+        on_todo = False
+        if ctx is not None:
+            try:
+                on_todo = ctx.todos.active() is not None
+            except Exception:  # noqa: BLE001
+                on_todo = False
+        try:
+            self.classifier.observe(cur["exe"], cur["title"], duration,
+                                    in_focus_session=in_focus,
+                                    on_active_todo=on_todo,
+                                    switched_away_fast=duration < 8)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[track] learning skipped: {exc}")
+
+    def _attribute_repo(self, cur: dict):
+        """Attribute the segment to a git repo + branch when we can tell."""
+        if not self.git or cur["idle"]:
+            return
+        try:
+            repo = self.git.repo_for_title(cur["title"], cur["exe"])
+            if repo:
+                self.git.record(cur["start"], cur["end"], repo, self.git.branch(repo))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[git] attribution skipped: {exc}")
 
     def reload_settings(self):
         if self.settings:
