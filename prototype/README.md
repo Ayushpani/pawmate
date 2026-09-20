@@ -119,8 +119,44 @@ tomorrow. Password managers are excluded from tracking by default.
 than baked into frames, so the gaze is continuous instead of needing a
 cached image per direction.
 
-**Commands** (double-click the pet, or right-click → Chat):
-`today` · `water` · `focus 25` · `pause 30m` · `resume` ·
+**Todo list** — right-click → *Today's tasks*, or `todo buy milk` / `done milk`.
+Mark one task with ▶ as *what I'm working on now*: time gets credited to it,
+and if you drift onto something distracting for 2 minutes the pet asks if
+you're still on it. Task matching is fuzzy, so `done milk` finds "buy the milk".
+
+**The YouTube-lecture problem.** No heuristic reliably tells a lecture from a
+time-sink, so there are two layers. First, built-in hints catch the common
+case (lecture / course / NPTEL / Coursera / docs / Stack Overflow → productive,
+even on YouTube). Second, and more importantly: **right-click → *Re-tag what
+I'm using now*** picks a keyword out of the window title (a channel or course
+name) and remembers it permanently. Correct it once, never again. User rules
+always beat built-in ones, and you can review or delete them in
+Settings → Category overrides.
+
+**Adjustable reminders + blocking breaks** — everything is configurable in
+Settings: water interval, stretch interval, eye-break (20-20-20) interval and
+length, idle threshold, water goal. Set any interval to **0** to turn it off.
+
+When a break fires it can **hold the whole screen**:
+- **Eye / stretch breaks** run a countdown then release themselves.
+- **Water breaks** wait for you to press **W**, and only then log the glass.
+- **Esc always skips**, immediately, and says so on screen.
+
+That escape hatch is not optional — an unescapable overlay is the worst
+possible failure for this feature — so there are three independent ways out:
+Esc bound globally (not just on the window), the timed auto-release, and a
+hard failsafe timer that force-closes the overlay even if a grab or callback
+goes wrong. Blocking can be turned off per-reminder in Settings.
+
+**Global hotkey** — **Ctrl + `** (backtick) opens the chat box from anywhere,
+even when the pet isn't focused. That combo is deliberate: Windows doesn't
+claim it (unlike Ctrl+Space, which IMEs take), and it's two keys under one
+hand. If another app has already taken it, the console says so at startup and
+double-clicking the pet still works.
+
+**Commands** (Ctrl+` , double-click the pet, or right-click → Chat):
+`todo <task>` · `done <task>` · `tasks` · `what's left` ·
+`today` · `water` · `focus 25` · `pause 30m` · `resume` · `settings` ·
 `open <app>` · `close <app>` · `walk` / `sit` / `sleep`
 
 ## Motion, not just art

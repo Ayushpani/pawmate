@@ -76,7 +76,10 @@ except ImportError:
 from PIL import Image, ImageTk
 
 import pawmate_ui as ui
-from pawmate_tracking import ActivityTracker, Store, fmt_minutes
+import pawmate_hotkey as hotkeys
+from pawmate_breaks import BreakOverlay, BreakScheduler
+from pawmate_tracking import (ActivityTracker, Settings, Store, Todos, UserRules,
+                              categorise_with, fmt_minutes, foreground_app, idle_seconds)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -1054,6 +1057,19 @@ def parse_local_command(text: str) -> dict | None:
         return {"action": "pose", "target": "sleep"}
     if t in ("idle", "stand"):
         return {"action": "pose", "target": "idle"}
+    if t in ("tasks", "todos", "todo list", "/todo", "/tasks"):
+        return {"action": "todos", "target": ""}
+    if t in ("settings", "/settings", "preferences"):
+        return {"action": "settings", "target": ""}
+    if t in ("what's left", "whats left", "progress", "status"):
+        return {"action": "todo_status", "target": ""}
+    if t.startswith(("todo ", "/todo ", "task ", "add task ", "remind me to ")):
+        body = re.sub(r"^(/?todo|task|add task|remind me to)\s+", "", text.strip(),
+                      flags=re.I)
+        return {"action": "add_todo", "target": body}
+    if t.startswith(("done ", "/done ", "finished ", "completed ")):
+        body = re.sub(r"^(/?done|finished|completed)\s+", "", text.strip(), flags=re.I)
+        return {"action": "done_todo", "target": body}
     if t in ("today", "stats", "report", "/today", "dashboard"):
         return {"action": "stats", "target": ""}
     if t in ("water", "/water", "drink"):
@@ -1141,12 +1157,28 @@ class PawmatePrototype:
         self.eye_items: list[int] = []
 
         self.store = Store()
+        self.settings = Settings(self.store)
+        self.rules = UserRules(self.store)
+        self.todos = Todos(self.store)
         self.tracker = ActivityTracker(self.store)
+        self.tracker.rules = self.rules          # user overrides win when categorising
+        self.tracker.settings = self.settings
         self.tracker.start()
         self._bubble = None
-        self._last_water = time.time()
-        self._last_break = time.time()
-        self.root.after(WATER_EVERY_S * 1000 // 4, self._check_reminders)
+        self._overlay = None
+        self._last_ontask_check = time.time()
+
+        self.breaks = BreakScheduler(self.settings, idle_seconds, self._fire_break)
+        self.root.after(5000, self._check_reminders)
+
+        # global hotkey for the unified chat box
+        self.hotkeys = hotkeys.HotkeyListener(self.settings.get("hotkey") or "ctrl+grave")
+        if self.hotkeys.start():
+            print(f"[hotkey] {hotkeys.describe(self.hotkeys.spec)} opens the chat box")
+        elif self.hotkeys.error:
+            print(f"[hotkey] unavailable: {self.hotkeys.error} "
+                  f"(double-click the pet instead)")
+        self.root.after(120, self._poll_hotkey)
 
         self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
         self.canvas.bind("<B1-Motion>", self._on_drag_move)
@@ -1303,7 +1335,9 @@ class PawmatePrototype:
         menu.add_command(label="Open app…", command=self._prompt_open_app)
         menu.add_separator()
         menu.add_command(label="📊  Today's activity", command=self._show_dashboard)
+        menu.add_command(label="✅  Today's tasks", command=self._show_todos)
         menu.add_command(label="💧  Log a glass of water", command=self._log_water)
+        menu.add_command(label="🏷  Re-tag what I'm using now", command=self._retag_current)
 
         focus_menu = tk.Menu(menu, tearoff=0)
         for m in (15, 25, 50):
@@ -1334,6 +1368,7 @@ class PawmatePrototype:
         menu.add_command(label="Sleep", command=lambda: self._set_pose("sleep"))
         menu.add_command(label="Walk", command=lambda: self._set_pose("walk"))
         menu.add_separator()
+        menu.add_command(label="⚙  Settings", command=self._show_settings)
         menu.add_command(label="Quit", command=self._quit)
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -1489,28 +1524,114 @@ class PawmatePrototype:
                                  int(self.state.x + CAT_SIZE / 2), int(self.state.y),
                                  actions=actions, timeout_ms=timeout_ms)
 
+    def _poll_hotkey(self):
+        self.root.after(120, self._poll_hotkey)
+        if self.hotkeys.poll():
+            self._open_chat()
+
     def _check_reminders(self):
-        """Water / break nudges (plan W1), paced off real activity."""
-        self.root.after(60_000, self._check_reminders)
-        if self.tracker.paused:
+        """Breaks + on-task nudges, both paced off real activity."""
+        self.root.after(15_000, self._check_reminders)
+        if self.tracker.paused or self._overlay is not None:
+            return
+        kind = self.breaks.due()
+        if kind:
+            self.breaks.fire(kind)
+            return
+        self._check_on_task()
+
+    def _fire_break(self, kind: str):
+        """Show the break. Blocking overlays hold the screen; Esc always skips."""
+        blocking = (self.settings.get("water_blocking") if kind == "water"
+                    else self.settings.get("blocking_breaks"))
+        if kind == "water":
+            if not blocking:
+                self.say("time for some water",
+                         actions=[("Done", self._log_water), ("Later", lambda: None)],
+                         timeout_ms=15000)
+                return
+            self._show_overlay("water", 90, on_done=self._log_water)
+        elif kind == "eye":
+            secs = int(self.settings.get("eye_duration_s") or 20)
+            if not blocking:
+                self.say(f"look away for {secs}s — 20-20-20", timeout_ms=8000)
+                return
+            self._show_overlay("eye", secs)
+        else:
+            if not blocking:
+                self.say("you've been at it a while.\nstretch for a bit?", timeout_ms=12000)
+                return
+            self._show_overlay("break", 60)
+
+    def _show_overlay(self, kind: str, seconds: int, on_done=None):
+        if self._overlay is not None:
+            return
+
+        def finish(skipped: bool):
+            self._overlay = None
+            self.store.log_event(f"break_{kind}", "skipped" if skipped else "done")
+            if not skipped and on_done:
+                on_done()
+            if skipped:
+                # don't re-nag instantly after an intentional skip
+                self.breaks.suspend(5 * 60)
+
+        self._overlay = BreakOverlay(
+            self.root, kind, seconds,
+            on_done=lambda: finish(False), on_skip=lambda: finish(True),
+            confirm_key="w")
+
+    # -- on-task detection (uses the active todo) --
+    def _check_on_task(self):
+        """If a task is marked active, credit time to it and nudge when the
+        foreground is something distracting instead."""
+        todo = self.todos.active()
+        if not todo:
             return
         now = time.time()
-        try:
-            idle = __import__("pawmate_tracking").idle_seconds()
-        except Exception:  # noqa: BLE001
-            idle = 0.0
-        if idle > 180:
-            self._last_break = now          # away from the desk counts as a break
+        dt = now - self._last_ontask_check
+        self._last_ontask_check = now
+        if dt <= 0 or dt > 300:
             return
-        if now - self._last_water >= WATER_EVERY_S:
-            self._last_water = now
-            self.say("time for some water 💧",
-                     actions=[("Done", self._log_water), ("Later", lambda: None)],
-                     timeout_ms=15000)
-        elif now - self._last_break >= BREAK_EVERY_S:
-            self._last_break = now
-            self.say("you've been at it 50 min.\nstretch for a bit?",
-                     actions=[("OK", lambda: None)], timeout_ms=15000)
+        exe, title = foreground_app()
+        cat = categorise_with(self.rules, exe, title)
+        if idle_seconds() > 120:
+            return
+        self.todos.add_spent(todo["id"], dt)
+        if cat == "distracting":
+            self._offtask_s = getattr(self, "_offtask_s", 0.0) + dt
+            if self._offtask_s >= 120:
+                self._offtask_s = 0.0
+                self.say(f"still on “{todo['text'][:28]}”?",
+                         actions=[("Yes", lambda: None),
+                                  ("Switch", self._show_todos)], timeout_ms=12000)
+        else:
+            self._offtask_s = 0.0
+
+    def _show_todos(self):
+        ui.TodoPanel(self.root, self.todos)
+
+    def _show_settings(self):
+        ui.SettingsPanel(self.root, self.settings, on_save=self._settings_saved,
+                         rules=self.rules)
+
+    def _settings_saved(self):
+        self.tracker.reload_settings()
+        ui.toast(self.root, "settings saved")
+
+    def _retag_current(self):
+        exe, title = foreground_app()
+        if not exe and not title:
+            ui.toast(self.root, "nothing focused to re-tag", ok=False)
+            return
+
+        def apply(pattern: str, category: str):
+            if not pattern:
+                return
+            kind = "title" if pattern.lower() in (title or "").lower() else "exe"
+            self.rules.add(kind, pattern, category)
+            ui.toast(self.root, f'"{pattern}" is now {category}')
+        ui.RetagDialog(self.root, exe, title, apply)
 
     def _log_water(self):
         self.store.log_water()
@@ -1537,8 +1658,10 @@ class PawmatePrototype:
         ai = bool(OPENROUTER_API_KEY or (CF_ACCOUNT_ID and CF_API_TOKEN))
         hint = ("Free text works too — AI is connected." if ai else
                 "Set OPENROUTER_API_KEY to also accept free text via AI.")
+        if getattr(self, "hotkeys", None) and self.hotkeys.ok:
+            hint = f"{hotkeys.describe(self.hotkeys.spec)} opens this from anywhere.  " + hint
         ui.CommandBar(self.root, self._handle_command, hint=hint,
-                      suggestions=("open notepad", "today", "water", "focus 25", "sleep"))
+                      suggestions=("todo ", "what's left", "today", "focus 25", "open notepad"))
 
     def _handle_command(self, text: str):
         action = parse_local_command(text)
@@ -1560,6 +1683,32 @@ class PawmatePrototype:
             self._close_app_by_title_substring(target)
         elif kind == "stats":
             self._show_dashboard()
+        elif kind == "todos":
+            self._show_todos()
+        elif kind == "settings":
+            self._show_settings()
+        elif kind == "add_todo":
+            self.todos.add(target)
+            ui.toast(self.root, f'added: {target}')
+        elif kind == "done_todo":
+            row = self.todos.find(target)
+            if row:
+                self.todos.set_done(row["id"], True)
+                done, total = self.todos.progress()
+                self._play_action("jump", duration=0.7)
+                ui.toast(self.root, f'done: {row["text"]}  ({done}/{total})')
+            else:
+                ui.toast(self.root, f'no task matching "{target}"', ok=False)
+        elif kind == "todo_status":
+            done, total = self.todos.progress()
+            rows = [r for r in self.todos.list() if not r["done"]]
+            if not total:
+                self.say("nothing planned yet.\nwant to add something?",
+                         actions=[("Open tasks", self._show_todos)], timeout_ms=10000)
+            else:
+                nxt = rows[0]["text"][:30] if rows else "all done!"
+                self.say(f"{done}/{total} done\nnext: {nxt}",
+                         actions=[("Open", self._show_todos)], timeout_ms=10000)
         elif kind == "water":
             self._log_water()
         elif kind == "focus":
@@ -1687,6 +1836,10 @@ class PawmatePrototype:
     def _quit(self):
         try:
             self.tracker.stop()          # flush the in-flight segment before exiting
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.hotkeys.stop()
         except Exception:  # noqa: BLE001
             pass
         self.root.destroy()

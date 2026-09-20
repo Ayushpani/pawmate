@@ -274,6 +274,9 @@ class ActivityTracker:
 
     def __init__(self, store: Store):
         self.store = store
+        self.rules = None            # set by the app: user category overrides
+        self.settings = None         # set by the app: live idle threshold etc.
+        self.idle_threshold = IDLE_THRESHOLD_S
         self.paused_until = 0.0
         self.excluded: list[str] = ["keepass", "bitwarden", "1password", "lastpass"]
         self._pending: list[tuple] = []
@@ -322,7 +325,7 @@ class ActivityTracker:
             self.current_label = "paused"
             return
 
-        is_idle = idle_seconds() >= IDLE_THRESHOLD_S
+        is_idle = idle_seconds() >= self.idle_threshold
         exe, title = foreground_app()
         if any(x in (exe or "").lower() for x in self.excluded):
             self._close_current(now)
@@ -349,10 +352,17 @@ class ActivityTracker:
         dur = max(0.0, cur["end"] - cur["start"])
         if dur < MIN_SEGMENT_S:
             return
-        cat = "" if cur["idle"] else categorise(cur["exe"], cur["title"])
+        cat = "" if cur["idle"] else categorise_with(self.rules, cur["exe"], cur["title"])
         with self._lock:
             self._pending.append((cur["start"], cur["end"], cur["exe"], cur["app"],
                                   cur["title"], cat, cur["idle"]))
+
+    def reload_settings(self):
+        if self.settings:
+            try:
+                self.idle_threshold = float(self.settings.get("idle_threshold_s") or IDLE_THRESHOLD_S)
+            except (TypeError, ValueError):
+                pass
 
     def flush(self):
         with self._lock:
@@ -392,3 +402,221 @@ def fmt_minutes(m: float) -> str:
     if m < 60:
         return f"{m}m"
     return f"{m // 60}h {m % 60:02d}m"
+
+
+# ---------------------------------------------------------------------------
+# Settings, user category overrides, and the day's todo list.
+#
+# Added as a second layer on top of the tracker above. Kept in the same
+# SQLite file so there's one thing to back up and one thing to delete.
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+SETTINGS_DEFAULTS = {
+    "water_every_min": 45,
+    "break_every_min": 50,
+    "eye_every_min": 20,          # 20-20-20 rule
+    "eye_duration_s": 20,
+    "blocking_breaks": True,      # break overlay holds the screen
+    "water_blocking": True,
+    "hotkey": "ctrl+grave",       # deliberately not a Windows default
+    "idle_threshold_s": 120,
+    "deep_work_target_min": 180,
+    "water_goal": 8,
+}
+
+
+class Settings:
+    """Key/value settings with typed defaults, persisted in SQLite."""
+
+    def __init__(self, store: "Store"):
+        self.store = store
+        store.conn.execute(
+            "CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT)")
+        store.conn.commit()
+        self._cache: dict = dict(SETTINGS_DEFAULTS)
+        for row in store.conn.execute("SELECT key,value FROM settings"):
+            try:
+                self._cache[row["key"]] = _json.loads(row["value"])
+            except Exception:  # noqa: BLE001
+                pass
+
+    def get(self, key: str):
+        return self._cache.get(key, SETTINGS_DEFAULTS.get(key))
+
+    def set(self, key: str, value):
+        self._cache[key] = value
+        self.store.conn.execute(
+            "INSERT INTO settings(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, _json.dumps(value)))
+        self.store.conn.commit()
+
+    def all(self) -> dict:
+        return dict(self._cache)
+
+    def reset(self):
+        self._cache = dict(SETTINGS_DEFAULTS)
+        self.store.conn.execute("DELETE FROM settings")
+        self.store.conn.commit()
+
+
+class UserRules:
+    """User category overrides (plan T3: one-click re-tag).
+
+    No heuristic can tell a YouTube lecture from a YouTube time-sink
+    reliably. So instead of guessing harder: let the user correct it once,
+    on the actual window title, and remember that forever. User rules are
+    consulted before any built-in rule.
+    """
+
+    def __init__(self, store: "Store"):
+        self.store = store
+        store.conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_rules(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT,           -- 'title' | 'exe'
+                pattern TEXT,        -- lowercase substring
+                category TEXT,
+                created_ts REAL)""")
+        store.conn.commit()
+        self.reload()
+
+    def reload(self):
+        self.rules = [(r["kind"], r["pattern"], r["category"])
+                      for r in self.store.conn.execute(
+                          "SELECT kind,pattern,category FROM user_rules ORDER BY LENGTH(pattern) DESC")]
+
+    def add(self, kind: str, pattern: str, category: str):
+        pattern = (pattern or "").strip().lower()
+        if not pattern:
+            return
+        self.store.conn.execute(
+            "DELETE FROM user_rules WHERE kind=? AND pattern=?", (kind, pattern))
+        self.store.conn.execute(
+            "INSERT INTO user_rules(kind,pattern,category,created_ts) VALUES(?,?,?,?)",
+            (kind, pattern, category, time.time()))
+        self.store.conn.commit()
+        self.reload()
+
+    def remove(self, kind: str, pattern: str):
+        self.store.conn.execute("DELETE FROM user_rules WHERE kind=? AND pattern=?",
+                                (kind, pattern.lower()))
+        self.store.conn.commit()
+        self.reload()
+
+    def match(self, exe: str, title: str) -> str | None:
+        t, e = (title or "").lower(), (exe or "").lower()
+        for kind, pattern, cat in self.rules:
+            if kind == "title" and pattern in t:
+                return cat
+            if kind == "exe" and pattern in e:
+                return cat
+        return None
+
+    def list_all(self) -> list[tuple[str, str, str]]:
+        return list(self.rules)
+
+
+# Broader built-in hints for study/learning content, so the common case is
+# right before any correction is needed. Still only a prior — the user rule
+# above always wins.
+_LEARNING_HINTS = (r"lecture|tutorial|course|lesson|chapter|exam|revision|"
+                   r"documentation|\bdocs\b|stack overflow|github|leetcode|"
+                   r"khan academy|coursera|udemy|edx|nptel|freecodecamp|"
+                   r"conference talk|keynote|how to|explained|crash course")
+
+
+def categorise_with(rules: "UserRules | None", exe: str, title: str) -> str:
+    """Categorise, consulting user overrides first."""
+    if rules:
+        hit = rules.match(exe, title)
+        if hit:
+            return hit
+    t = (title or "").lower()
+    if re.search(_LEARNING_HINTS, t):
+        return PRODUCTIVE
+    return categorise(exe, title)
+
+
+# ---------------------------------------------------------------------------
+# Todos
+# ---------------------------------------------------------------------------
+
+def today_key(day_offset: int = 0) -> str:
+    return time.strftime("%Y-%m-%d", time.localtime(time.time() - day_offset * 86400))
+
+
+class Todos:
+    """The day's task list, plus which one is currently being worked on."""
+
+    def __init__(self, store: "Store"):
+        self.store = store
+        store.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS todos(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                day TEXT NOT NULL, text TEXT NOT NULL,
+                done INTEGER DEFAULT 0, created_ts REAL, done_ts REAL,
+                est_min INTEGER DEFAULT 0, active INTEGER DEFAULT 0,
+                spent_s REAL DEFAULT 0);
+            CREATE INDEX IF NOT EXISTS idx_todo_day ON todos(day);
+        """)
+        store.conn.commit()
+
+    def add(self, text: str, est_min: int = 0, day: str | None = None) -> int:
+        cur = self.store.conn.execute(
+            "INSERT INTO todos(day,text,created_ts,est_min) VALUES(?,?,?,?)",
+            (day or today_key(), text.strip(), time.time(), est_min))
+        self.store.conn.commit()
+        return cur.lastrowid
+
+    def list(self, day: str | None = None) -> list:
+        return list(self.store.conn.execute(
+            "SELECT * FROM todos WHERE day=? ORDER BY done, id", (day or today_key(),)))
+
+    def set_done(self, todo_id: int, done: bool = True):
+        self.store.conn.execute(
+            "UPDATE todos SET done=?, done_ts=?, active=0 WHERE id=?",
+            (int(done), time.time() if done else None, todo_id))
+        self.store.conn.commit()
+
+    def delete(self, todo_id: int):
+        self.store.conn.execute("DELETE FROM todos WHERE id=?", (todo_id,))
+        self.store.conn.commit()
+
+    def set_active(self, todo_id: int | None):
+        """Exactly one task can be 'what I'm working on right now'."""
+        self.store.conn.execute("UPDATE todos SET active=0 WHERE day=?", (today_key(),))
+        if todo_id:
+            self.store.conn.execute("UPDATE todos SET active=1, done=0 WHERE id=?", (todo_id,))
+        self.store.conn.commit()
+
+    def active(self):
+        return self.store.conn.execute(
+            "SELECT * FROM todos WHERE day=? AND active=1 LIMIT 1", (today_key(),)).fetchone()
+
+    def add_spent(self, todo_id: int, seconds: float):
+        self.store.conn.execute("UPDATE todos SET spent_s=spent_s+? WHERE id=?",
+                                (seconds, todo_id))
+        self.store.conn.commit()
+
+    def find(self, needle: str):
+        """Fuzzy-ish lookup so chat can say 'done milk' for 'buy the milk'."""
+        needle = needle.strip().lower()
+        if not needle:
+            return None
+        rows = self.list()
+        for r in rows:
+            if r["text"].lower() == needle:
+                return r
+        for r in rows:
+            if needle in r["text"].lower():
+                return r
+        import difflib
+        names = {r["text"].lower(): r for r in rows}
+        close = difflib.get_close_matches(needle, names.keys(), n=1, cutoff=0.6)
+        return names[close[0]] if close else None
+
+    def progress(self, day: str | None = None) -> tuple[int, int]:
+        rows = self.list(day)
+        return sum(1 for r in rows if r["done"]), len(rows)

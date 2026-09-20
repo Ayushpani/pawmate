@@ -331,3 +331,254 @@ def confirm(master, text: str, on_yes, yes="Yes", no="Cancel"):
     mk(row, no, MUTED, lambda: None).pack(side="right")
     p.bind("<Return>", lambda e: (p.destroy(), on_yes()))
     return p
+
+
+# ---------------------------------------------------------------------------
+# Todo list
+# ---------------------------------------------------------------------------
+
+class TodoPanel(Panel):
+    """The day's task list. One task can be marked 'working on this now',
+    which is what lets the pet tell on-task from off-task."""
+
+    def __init__(self, master, todos, on_change=None):
+        super().__init__(master, "Today's tasks", 520, 520)
+        self.todos = todos
+        self.on_change = on_change
+
+        add = tk.Frame(self.body, bg=BG)
+        add.pack(fill="x", padx=16, pady=(4, 10))
+        self.entry = tk.Entry(add, bg=CARD, fg=FG, insertbackground=ACCENT,
+                              relief="flat", font=_font(11))
+        self.entry.pack(side="left", fill="x", expand=True, ipady=7)
+        self.entry.bind("<Return>", self._add)
+        btn = tk.Label(add, text="+ add", bg=CARD_HI, fg=ACCENT, font=_font(10),
+                       padx=14, pady=7, cursor="hand2")
+        btn.pack(side="right", padx=(8, 0))
+        btn.bind("<Button-1>", self._add)
+
+        self.progress = tk.Label(self.body, text="", bg=BG, fg=MUTED, font=_font(9))
+        self.progress.pack(anchor="w", padx=16)
+
+        self.list_frame = tk.Frame(self.body, bg=BG)
+        self.list_frame.pack(fill="both", expand=True, padx=10, pady=8)
+
+        tk.Label(self.body, text="Click a task to mark it done · ▶ sets what you're working on",
+                 bg=BG, fg=MUTED, font=_font(8)).pack(anchor="w", padx=16, pady=(0, 10))
+        self.refresh()
+        self.after(90, self.entry.focus_force)
+
+    def _add(self, _e=None):
+        text = self.entry.get().strip()
+        if not text:
+            return
+        self.todos.add(text)
+        self.entry.delete(0, "end")
+        self.refresh()
+
+    def refresh(self):
+        for w in self.list_frame.winfo_children():
+            w.destroy()
+        rows = self.todos.list()
+        done, total = self.todos.progress()
+        self.progress.config(text=f"{done} of {total} done" if total else "nothing planned yet")
+
+        if not rows:
+            tk.Label(self.list_frame, text="Add what you want to get done today.",
+                     bg=BG, fg=MUTED, font=_font(9)).pack(anchor="w", padx=8, pady=10)
+        for r in rows:
+            self._row(r)
+        if self.on_change:
+            self.on_change()
+
+    def _row(self, r):
+        active = bool(r["active"])
+        done = bool(r["done"])
+        bg = CARD_HI if active else CARD
+        row = tk.Frame(self.list_frame, bg=bg)
+        row.pack(fill="x", pady=2, padx=6)
+
+        box = tk.Label(row, text="✓" if done else "○", bg=bg,
+                       fg=(ACCENT if done else MUTED), font=_font(12), cursor="hand2",
+                       padx=10, pady=8)
+        box.pack(side="left")
+        box.bind("<Button-1>", lambda e, i=r["id"], d=done: (
+            self.todos.set_done(i, not d), self.refresh()))
+
+        label = tk.Label(row, text=r["text"][:48], bg=bg,
+                         fg=(MUTED if done else FG), font=_font(10), anchor="w", cursor="hand2")
+        label.pack(side="left", fill="x", expand=True, pady=8)
+        label.bind("<Button-1>", lambda e, i=r["id"], d=done: (
+            self.todos.set_done(i, not d), self.refresh()))
+
+        if r["spent_s"]:
+            tk.Label(row, text=fmt_minutes(r["spent_s"] / 60), bg=bg, fg=MUTED,
+                     font=_font(8)).pack(side="right", padx=6)
+
+        if not done:
+            play = tk.Label(row, text="▶" if not active else "■", bg=bg,
+                            fg=(ACCENT if active else MUTED), font=_font(10),
+                            cursor="hand2", padx=10)
+            play.pack(side="right")
+            play.bind("<Button-1>", lambda e, i=r["id"], a=active: (
+                self.todos.set_active(None if a else i), self.refresh()))
+
+        dele = tk.Label(row, text="✕", bg=bg, fg="#59606d", font=_font(9),
+                        cursor="hand2", padx=8)
+        dele.pack(side="right")
+        dele.bind("<Button-1>", lambda e, i=r["id"]: (self.todos.delete(i), self.refresh()))
+
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+class SettingsPanel(Panel):
+    """Everything about reminders is adjustable here (plan §4.13)."""
+
+    FIELDS = [
+        ("water_every_min", "Water reminder", "every N minutes of active time", 0, 180),
+        ("break_every_min", "Stretch break", "every N minutes", 0, 240),
+        ("eye_every_min", "Eye break (20-20-20)", "every N minutes", 0, 120),
+        ("eye_duration_s", "Eye break length", "seconds", 5, 120),
+        ("idle_threshold_s", "Count as idle after", "seconds with no input", 30, 900),
+        ("water_goal", "Daily water goal", "glasses", 1, 20),
+    ]
+
+    def __init__(self, master, settings, on_save=None, rules=None):
+        super().__init__(master, "Settings", 560, 620)
+        self.settings = settings
+        self.on_save = on_save
+        self.rules = rules
+        self.vars: dict[str, tk.StringVar] = {}
+
+        tk.Label(self.body, text="Reminders", bg=BG, fg=MUTED,
+                 font=_font(9, "bold")).pack(anchor="w", padx=18, pady=(4, 6))
+        for key, label, hint, lo, hi in self.FIELDS:
+            self._field(key, label, hint, lo, hi)
+
+        tk.Label(self.body, text="Breaks", bg=BG, fg=MUTED,
+                 font=_font(9, "bold")).pack(anchor="w", padx=18, pady=(12, 6))
+        self.block_var = tk.BooleanVar(value=bool(settings.get("blocking_breaks")))
+        self.water_block_var = tk.BooleanVar(value=bool(settings.get("water_blocking")))
+        self._check("Breaks hold the screen (Esc always skips)", self.block_var)
+        self._check("Water reminder holds the screen too", self.water_block_var)
+
+        tk.Label(self.body, text="0 turns a reminder off entirely.",
+                 bg=BG, fg=MUTED, font=_font(8)).pack(anchor="w", padx=18, pady=(10, 0))
+
+        foot = tk.Frame(self.body, bg=BG)
+        foot.pack(fill="x", padx=18, pady=14, side="bottom")
+        save = tk.Label(foot, text="Save", bg=CARD_HI, fg=ACCENT, font=_font(10),
+                        padx=18, pady=8, cursor="hand2")
+        save.pack(side="right")
+        save.bind("<Button-1>", lambda e: self._save())
+        if self.rules is not None:
+            mgr = tk.Label(foot, text="Category overrides…", bg=BG, fg=MUTED,
+                           font=_font(9), cursor="hand2")
+            mgr.pack(side="left")
+            mgr.bind("<Button-1>", lambda e: RulesPanel(self.master, self.rules))
+
+    def _field(self, key, label, hint, lo, hi):
+        row = tk.Frame(self.body, bg=CARD)
+        row.pack(fill="x", padx=14, pady=3)
+        tk.Label(row, text=label, bg=CARD, fg=FG, font=_font(10),
+                 anchor="w").pack(side="left", padx=12, pady=9)
+        v = tk.StringVar(value=str(self.settings.get(key)))
+        self.vars[key] = v
+        e = tk.Entry(row, textvariable=v, bg=CARD_HI, fg=FG, insertbackground=ACCENT,
+                     relief="flat", width=6, justify="center", font=_font(10))
+        e.pack(side="right", padx=12, ipady=4)
+        tk.Label(row, text=hint, bg=CARD, fg=MUTED,
+                 font=_font(8)).pack(side="right", padx=4)
+
+    def _check(self, label, var):
+        row = tk.Frame(self.body, bg=CARD)
+        row.pack(fill="x", padx=14, pady=3)
+        c = tk.Checkbutton(row, text=label, variable=var, bg=CARD, fg=FG,
+                           selectcolor=CARD_HI, activebackground=CARD,
+                           activeforeground=FG, font=_font(10), anchor="w",
+                           highlightthickness=0, bd=0)
+        c.pack(side="left", padx=8, pady=7, fill="x")
+
+    def _save(self):
+        for key, _l, _h, lo, hi in self.FIELDS:
+            try:
+                val = int(float(self.vars[key].get()))
+            except ValueError:
+                continue
+            self.settings.set(key, max(lo if key != "water_every_min" else 0, min(hi, val)))
+        self.settings.set("blocking_breaks", bool(self.block_var.get()))
+        self.settings.set("water_blocking", bool(self.water_block_var.get()))
+        self.destroy()
+        if self.on_save:
+            self.on_save()
+
+
+class RulesPanel(Panel):
+    """Shows and removes user category overrides (the YouTube-lecture fix)."""
+
+    def __init__(self, master, rules):
+        super().__init__(master, "Category overrides", 520, 420)
+        self.rules = rules
+        tk.Label(self.body,
+                 text="These win over the built-in rules. Re-tag from the pet's\n"
+                      "right-click menu while the app is focused.",
+                 bg=BG, fg=MUTED, font=_font(9), justify="left").pack(anchor="w", padx=18, pady=(4, 10))
+        self.list_frame = tk.Frame(self.body, bg=BG)
+        self.list_frame.pack(fill="both", expand=True, padx=10)
+        self.refresh()
+
+    def refresh(self):
+        for w in self.list_frame.winfo_children():
+            w.destroy()
+        items = self.rules.list_all()
+        if not items:
+            tk.Label(self.list_frame, text="No overrides yet.", bg=BG, fg=MUTED,
+                     font=_font(9)).pack(anchor="w", padx=10, pady=8)
+        for kind, pattern, cat in items:
+            row = tk.Frame(self.list_frame, bg=CARD)
+            row.pack(fill="x", pady=2, padx=6)
+            tk.Label(row, text=f"{kind}: “{pattern}”", bg=CARD, fg=FG, font=_font(9),
+                     anchor="w").pack(side="left", padx=12, pady=8, fill="x", expand=True)
+            tk.Label(row, text=cat, bg=CARD, fg=CAT_COLORS.get(cat, FG),
+                     font=_font(9, "bold")).pack(side="right", padx=10)
+            x = tk.Label(row, text="✕", bg=CARD, fg="#59606d", font=_font(9), cursor="hand2")
+            x.pack(side="right", padx=8)
+            x.bind("<Button-1>", lambda e, k=kind, p=pattern: (
+                self.rules.remove(k, p), self.refresh()))
+
+
+class RetagDialog(Panel):
+    """Re-tag whatever is currently focused, and remember it."""
+
+    def __init__(self, master, exe: str, title: str, on_pick):
+        super().__init__(master, "Re-tag this", 520, 300)
+        shown = (title or exe or "unknown")[:70]
+        tk.Label(self.body, text=shown, bg=BG, fg=FG, font=_font(11, "bold"),
+                 wraplength=470, justify="left").pack(anchor="w", padx=18, pady=(6, 2))
+        tk.Label(self.body, text=f"({exe})", bg=BG, fg=MUTED,
+                 font=_font(8)).pack(anchor="w", padx=18)
+
+        tk.Label(self.body, text="Remember this as:", bg=BG, fg=MUTED,
+                 font=_font(9)).pack(anchor="w", padx=18, pady=(14, 6))
+
+        # Match on a distinctive word from the title so the rule generalises
+        # (e.g. a channel or course name), not on the exact full title.
+        words = [w for w in (title or "").lower().replace("-", " ").split() if len(w) > 3]
+        self.key_var = tk.StringVar(value=(words[0] if words else (exe or "").lower()))
+        e = tk.Entry(self.body, textvariable=self.key_var, bg=CARD, fg=FG,
+                     insertbackground=ACCENT, relief="flat", font=_font(10))
+        e.pack(fill="x", padx=18, ipady=6)
+        tk.Label(self.body, text="any window title containing this word gets that category",
+                 bg=BG, fg=MUTED, font=_font(8)).pack(anchor="w", padx=18, pady=(4, 12))
+
+        row = tk.Frame(self.body, bg=BG)
+        row.pack(fill="x", padx=18)
+        for cat, col in (("productive", GOOD), ("neutral", CAT_COLORS["neutral"]),
+                         ("distracting", BAD)):
+            b = tk.Label(row, text=cat, bg=CARD_HI, fg=col, font=_font(10),
+                         padx=14, pady=9, cursor="hand2")
+            b.pack(side="left", padx=(0, 8))
+            b.bind("<Button-1>", lambda ev, c=cat: (
+                self.destroy(), on_pick(self.key_var.get().strip(), c)))
